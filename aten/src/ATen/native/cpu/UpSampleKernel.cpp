@@ -130,18 +130,18 @@ static inline scalar_t interpolate_aa_single_dim_zero_strides(
 
   char* src_min = src + ids_min;
 
-  scalar_t t = *(scalar_t*)&src_min[0];
+  float t = (float)(*(scalar_t*)&src_min[0]);
   index_t wts_idx = *(index_t*)&data[4][0];
-  scalar_t* wts_ptr = (scalar_t*)&data[3][wts_idx];
-  scalar_t wts = wts_ptr[0];
+  float * wts_ptr = (float*)&data[3][wts_idx];
+  float wts = wts_ptr[0];
 
-  scalar_t output = t * wts;
+  float output = t * wts;
   for (const auto j : c10::irange(1, ids_size)) {
     wts = wts_ptr[j];
-    t = *(scalar_t*)&src_min[j * ids_stride];
+    t = (float)*(scalar_t*)&src_min[j * ids_stride];
     output += t * wts;
   }
-  return output;
+  return (scalar_t)output;
 }
 
 template <typename scalar_t, typename index_t>
@@ -156,18 +156,18 @@ static inline scalar_t interpolate_aa_single_dim(
 
   char* src_min = src + ids_min;
 
-  scalar_t t = *(scalar_t*)&src_min[0];
+  float t = (float)(*(scalar_t*)&src_min[0]);
   index_t wts_idx = *(index_t*)&data[4][i * strides[4]];
-  scalar_t* wts_ptr = (scalar_t*)&data[3][wts_idx];
-  scalar_t wts = wts_ptr[0];
+  float * wts_ptr = (float*)&data[3][wts_idx];
+  float wts = (wts_ptr[0]);
 
-  scalar_t output = t * wts;
+  float output = t * wts;
   for (const auto j : c10::irange(1, ids_size)) {
     wts = wts_ptr[j];
-    t = *(scalar_t*)&src_min[j * ids_stride];
+    t = (float)(*(scalar_t*)&src_min[j * ids_stride]);
     output += t * wts;
   }
-  return output;
+  return (scalar_t)output;
 }
 
 template<int m>
@@ -1187,7 +1187,7 @@ void _separable_upsample_generic_Nd_kernel_impl_single_dim(
 
   indices_weights.emplace_back(
       F::compute_indices_weights_aa(
-        input_scalar_type, input.size(interp_dim), oshape[interp_dim],
+        ScalarType::Float, input.size(interp_dim), oshape[interp_dim],
         input.stride(interp_dim) * input.element_size(),
         input.dim(), interp_dim, align_corners, scales[interp_dim - 2]));
 
@@ -1203,19 +1203,13 @@ void _separable_upsample_generic_Nd_kernel_impl_single_dim(
     }
   }
 
-  auto iter = config.build();
 
-  if (interp_size > 1) {
-    // Nearest also supports uint8 tensor, so need to handle it separately
-    AT_DISPATCH_FLOATING_TYPES(iter.dtype(), "upsample_generic_Nd_aa", [&] {
-      cpu_upsample_generic_aa<scalar_t>(iter);
-    });
-  } else {
+  auto iter = config.build();
     AT_DISPATCH_FLOATING_TYPES_AND(
-        at::ScalarType::Byte, iter.dtype(), "upsample_generic_Nd_aa", [&] {
-          cpu_upsample_generic_aa<scalar_t>(iter);
-        });
-  }
+    at::ScalarType::Byte, iter.dtype(), "upsample_generic_Nd_aa", [&] {
+        cpu_upsample_generic_aa<scalar_t>(iter);
+    });
+
 }
 
 template <int out_ndims, typename scale_type, class F>
