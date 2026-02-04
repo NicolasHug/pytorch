@@ -9,6 +9,7 @@
 #include <ATen/native/cpu/utils.h>
 #include <c10/util/irange.h>
 #include <ATen/native/cpu/UpSampleKernelAVXAntialias.h>
+#include <ATen/native/cpu/UpSampleKernelNEONAntialias.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -1698,6 +1699,39 @@ int _use_vectorized_kernel_cond_3d(
       return ((input.is_contiguous(at::MemoryFormat::ChannelsLast3d)) && (input.size(1) > 3));
 }
 
+#if defined(__aarch64__) && !defined(C10_MOBILE)
+#include <arm_neon.h>
+// NEON stub for bilinear/bicubic uint8 interpolation with antialiasing.
+// This scaffolding dispatches to a test implementation for verification.
+// A full NEON implementation will be added later.
+template <typename scale_type, class F>
+void upsample_neon_bilinear_bicubic_uint8(
+    const at::Tensor& input,
+    const at::Tensor& output,
+    bool align_corners,
+    const scale_type& scales,
+    bool antialias) {
+  printf("NEON dispatch: upsample_neon_bilinear_bicubic_uint8 called!\n");
+  printf("  input shape: [%ld, %ld, %ld, %ld]\n",
+         (long)input.size(0), (long)input.size(1),
+         (long)input.size(2), (long)input.size(3));
+  printf("  output shape: [%ld, %ld, %ld, %ld]\n",
+         (long)output.size(0), (long)output.size(1),
+         (long)output.size(2), (long)output.size(3));
+
+  // Test NEON: add two vectors of 4 floats
+  float32x4_t a = vdupq_n_f32(1.5f);
+  float32x4_t b = vdupq_n_f32(2.5f);
+  float32x4_t c = vaddq_f32(a, b);
+  float result[4];
+  vst1q_f32(result, c);
+  printf("  NEON test: 1.5 + 2.5 = %f (should be 4.0)\n", result[0]);
+
+  // Zero out the output tensor
+  output.zero_();
+}
+#endif // defined(__aarch64__) && !defined(C10_MOBILE)
+
 
 void upsample_nearest2d_kernel_impl(
     const Tensor& output,
@@ -1840,6 +1874,16 @@ void upsample_bilinear2d_aa_kernel_impl(
         output, input, align_corners, {scales_h, scales_w},
         /*antialias=*/true);
   }
+#elif defined(__aarch64__) && !defined(C10_MOBILE)
+  if (input.dtype() == at::kByte && input.size(1) <= 4) {
+    upsample_neon_bilinear_bicubic_uint8<scale_t, HelperInterpLinear>(
+      input, output, align_corners, {scales_h, scales_w},
+      /*antialias=*/true);
+  } else {
+    separable_upsample_generic_Nd_kernel_impl<2, scale_t, HelperInterpLinear>(
+        output, input, align_corners, {scales_h, scales_w},
+        /*antialias=*/true);
+  }
 #else // CPU_CAPABILITY_AVX2
   separable_upsample_generic_Nd_kernel_impl<2, scale_t, HelperInterpLinear>(
       output, input, align_corners, {scales_h, scales_w},
@@ -1904,6 +1948,16 @@ void upsample_bicubic2d_aa_kernel_impl(
 #ifdef CPU_CAPABILITY_AVX2
   if (input.dtype() == at::kByte && input.size(1) <= 4) {
     upsample_avx_bilinear_bicubic_uint8<scale_t, HelperInterpCubic>(
+      input, output, align_corners, {scales_h, scales_w},
+      /*antialias=*/true);
+  } else {
+    separable_upsample_generic_Nd_kernel_impl<2, scale_t, HelperInterpCubic>(
+        output, input, align_corners, {scales_h, scales_w},
+        /*antialias=*/true);
+  }
+#elif defined(__aarch64__) && !defined(C10_MOBILE)
+  if (input.dtype() == at::kByte && input.size(1) <= 4) {
+    upsample_neon_bilinear_bicubic_uint8<scale_t, HelperInterpCubic>(
       input, output, align_corners, {scales_h, scales_w},
       /*antialias=*/true);
   } else {
