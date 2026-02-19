@@ -1,7 +1,7 @@
 """
 Test and benchmark for NEON bilinear interpolation with antialias.
 
-Compares the NEON implementation against PyTorch's uint8 reference implementation.
+Compares the NEON implementation against PyTorch's uint8 reference.
 """
 
 import torch
@@ -31,26 +31,46 @@ def test_basic():
         torch.manual_seed(42)
         input_tensor = torch.randint(0, 256, input_shape, dtype=torch.uint8)
 
-        # NEON implementation
         output_neon = neon_interpolate.neon_upsample_bilinear2d_aa(
             input_tensor, list(output_size)
         )
-
-        # Reference uint8 implementation
         output_ref = torch.nn.functional.interpolate(
             input_tensor, size=output_size, mode="bilinear", antialias=True
         )
 
-        diff = (output_neon.float() - output_ref.float()).abs()
-        max_diff = diff.max().item()
-        mean_diff = diff.mean().item()
+        diff_neon = (output_neon.float() - output_ref.float()).abs()
+        max_diff_neon = diff_neon.max().item()
+        mean_diff_neon = diff_neon.mean().item()
 
-        status = "PASS" if max_diff <= 1 else "FAIL"
-        if max_diff > 1:
+        status_neon = "PASS" if max_diff_neon <= 1 else "FAIL"
+
+        # Tiled only supports batch=1
+        if input_shape[0] == 1:
+            output_tiled = neon_interpolate.tiled_upsample_bilinear2d_aa(
+                input_tensor, list(output_size)
+            )
+            diff_tiled = (output_tiled.float() - output_ref.float()).abs()
+            max_diff_tiled = diff_tiled.max().item()
+            mean_diff_tiled = diff_tiled.mean().item()
+            status_tiled = "PASS" if max_diff_tiled <= 1 else "FAIL"
+            if max_diff_tiled > 1:
+                all_passed = False
+        else:
+            max_diff_tiled = None
+
+        if max_diff_neon > 1:
             all_passed = False
 
         print(f"{name}:")
-        print(f"  Max diff: {max_diff}, Mean diff: {mean_diff:.4f} [{status}]")
+        print(
+            f"  NEON:  max_diff={max_diff_neon}, mean_diff={mean_diff_neon:.4f} [{status_neon}]"
+        )
+        if max_diff_tiled is not None:
+            print(
+                f"  Tiled: max_diff={max_diff_tiled}, mean_diff={mean_diff_tiled:.4f} [{status_tiled}]"
+            )
+        else:
+            print("  Tiled: skipped (batch > 1)")
 
     print()
     return all_passed
@@ -64,66 +84,48 @@ def test_memory_formats():
     input_cont = torch.randint(0, 256, (1, 3, 64, 64), dtype=torch.uint8)
     input_cl = input_cont.contiguous(memory_format=torch.channels_last)
 
-    # Test contiguous input
-    output_cont = neon_interpolate.neon_upsample_bilinear2d_aa(input_cont, [32, 32])
-    ref_cont = torch.nn.functional.interpolate(
-        input_cont, size=(32, 32), mode="bilinear", antialias=True
-    )
-    diff_cont = (output_cont.float() - ref_cont.float()).abs().max().item()
+    all_passed = True
+    for label, inp in [("Contiguous", input_cont), ("Channels_last", input_cl)]:
+        ref = torch.nn.functional.interpolate(
+            inp, size=(32, 32), mode="bilinear", antialias=True
+        )
+        out_neon = neon_interpolate.neon_upsample_bilinear2d_aa(inp, [32, 32])
+        out_tiled = neon_interpolate.tiled_upsample_bilinear2d_aa(inp, [32, 32])
+        diff_neon = (out_neon.float() - ref.float()).abs().max().item()
+        diff_tiled = (out_tiled.float() - ref.float()).abs().max().item()
+        if diff_neon > 1 or diff_tiled > 1:
+            all_passed = False
 
-    # Test channels_last input
-    output_cl = neon_interpolate.neon_upsample_bilinear2d_aa(input_cl, [32, 32])
-    ref_cl = torch.nn.functional.interpolate(
-        input_cl, size=(32, 32), mode="bilinear", antialias=True
-    )
-    diff_cl = (output_cl.float() - ref_cl.float()).abs().max().item()
-
-    print(f"Contiguous input:")
-    print(
-        f"  Input is channels_last: {input_cont.is_contiguous(memory_format=torch.channels_last)}"
-    )
-    print(f"  Output is contiguous: {output_cont.is_contiguous()}")
-    print(f"  Max diff: {diff_cont}")
-
-    print(f"\nChannels_last input:")
-    print(
-        f"  Input is channels_last: {input_cl.is_contiguous(memory_format=torch.channels_last)}"
-    )
-    print(
-        f"  Output is channels_last: {output_cl.is_contiguous(memory_format=torch.channels_last)}"
-    )
-    print(f"  Max diff: {diff_cl}")
+        print(f"{label} input:")
+        print(f"  NEON max diff:  {diff_neon}")
+        print(f"  Tiled max diff: {diff_tiled}")
 
     print()
-    return diff_cont <= 1 and diff_cl <= 1
+    return all_passed
 
 
 def benchmark():
-    """Benchmark NEON vs reference uint8 implementation."""
+    """Benchmark NEON vs reference."""
     print("=== Benchmark (single-threaded) ===\n")
 
-    # Force single-threaded execution for fair comparison
     torch.set_num_threads(1)
     print(f"torch.get_num_threads() = {torch.get_num_threads()}\n")
 
     configs = [
-        # Original benchmarks
         ("224x224 -> 112x112 (downscale 2x)", (4, 3, 224, 224), (112, 112)),
         ("224x224 -> 448x448 (upscale 2x)", (4, 3, 224, 224), (448, 448)),
         ("512x512 -> 256x256 (downscale 2x)", (1, 3, 512, 512), (256, 256)),
         ("64x64 -> 224x224 (upscale ~3.5x)", (4, 3, 64, 64), (224, 224)),
-        # 720p (1280x720) benchmarks
         ("720p -> 360p (downscale 2x)", (1, 3, 720, 1280), (360, 640)),
         ("720p -> 480p (downscale ~1.5x)", (1, 3, 720, 1280), (480, 854)),
         ("720p -> 256x256 (downscale)", (1, 3, 720, 1280), (256, 256)),
-        # 4K (3840x2160) benchmarks
         ("4K -> 1080p (downscale 2x)", (1, 3, 2160, 3840), (1080, 1920)),
         ("4K -> 720p (downscale 3x)", (1, 3, 2160, 3840), (720, 1280)),
         ("4K -> 256x256 (downscale)", (1, 3, 2160, 3840), (256, 256)),
     ]
 
     n_warmup = 3
-    n_iters = 10  # Fewer iterations for large images
+    n_iters = 10
 
     for name, input_shape, output_size in configs:
         torch.manual_seed(42)
@@ -131,35 +133,34 @@ def benchmark():
 
         # Warmup
         for _ in range(n_warmup):
-            _ = neon_interpolate.neon_upsample_bilinear2d_aa(
+            neon_interpolate.neon_upsample_bilinear2d_aa(
                 input_tensor, list(output_size)
             )
-            _ = torch.nn.functional.interpolate(
+            torch.nn.functional.interpolate(
                 input_tensor, size=output_size, mode="bilinear", antialias=True
             )
 
         # Benchmark NEON
         start = time.perf_counter()
         for _ in range(n_iters):
-            _ = neon_interpolate.neon_upsample_bilinear2d_aa(
+            neon_interpolate.neon_upsample_bilinear2d_aa(
                 input_tensor, list(output_size)
             )
         neon_time = (time.perf_counter() - start) / n_iters * 1000
 
-        # Benchmark reference uint8
+        # Benchmark reference
         start = time.perf_counter()
         for _ in range(n_iters):
-            _ = torch.nn.functional.interpolate(
+            torch.nn.functional.interpolate(
                 input_tensor, size=output_size, mode="bilinear", antialias=True
             )
         ref_time = (time.perf_counter() - start) / n_iters * 1000
 
-        speedup = ref_time / neon_time
         print(f"{name}:")
         print(f"  Input shape: {input_shape}")
         print(f"  NEON:      {neon_time:.3f} ms")
         print(f"  Reference: {ref_time:.3f} ms")
-        print(f"  Speedup:   {speedup:.2f}x")
+        print(f"  Speedup vs ref: {ref_time / neon_time:.2f}x")
         print()
 
 
@@ -169,14 +170,11 @@ def main():
     print("=" * 60)
     print()
 
-    # Run tests
     basic_passed = test_basic()
     format_passed = test_memory_formats()
 
-    # Run benchmark
     benchmark()
 
-    # Summary
     print("=" * 60)
     print("Summary")
     print("=" * 60)

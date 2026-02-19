@@ -8,7 +8,22 @@ setup(
             "neon_interpolate._C",
             ["csrc/neon_upsample.cpp"],
             extra_compile_args={"cxx": ["-O3"]},
-        )
+        ),
+        cpp_extension.CppExtension(
+            "neon_interpolate._C_sve2",
+            ["csrc/sve2_upsample.cpp"],
+            extra_compile_args={"cxx": ["-O3", "-march=native"]},
+        ),
+        cpp_extension.CppExtension(
+            "neon_interpolate._C_tiled",
+            ["csrc/tiled.cpp"],
+            extra_compile_args={"cxx": ["-O3"]},
+        ),
+        cpp_extension.CppExtension(
+            "neon_interpolate._C_tiled_neon",
+            ["csrc/tiled_neon.cpp"],
+            extra_compile_args={"cxx": ["-O3"]},
+        ),
     ],
     cmdclass={"build_ext": cpp_extension.BuildExtension},
     packages=["neon_interpolate"],
