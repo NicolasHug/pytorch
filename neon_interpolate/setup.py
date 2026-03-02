@@ -24,6 +24,16 @@ setup(
             ["csrc/tiled_neon.cpp"],
             extra_compile_args={"cxx": ["-O3"]},
         ),
+        cpp_extension.CppExtension(
+            "neon_interpolate._C_ring",
+            ["csrc/ring_buffer.cpp"],
+            extra_compile_args={"cxx": ["-O3"]},
+        ),
+        cpp_extension.CppExtension(
+            "neon_interpolate._C_ring_neon",
+            ["csrc/ring_buffer_neon.cpp"],
+            extra_compile_args={"cxx": ["-O3"]},
+        ),
     ],
     cmdclass={"build_ext": cpp_extension.BuildExtension},
     packages=["neon_interpolate"],
