@@ -37,69 +37,52 @@ using scale_t = std::vector<std::optional<double>>;
 //   "non-zero-stride" - we should unify all this.
 // - the terms "zero-stride" and "non-zero strides" refer to the weights and
 //   indices, not to the contiguity of input or output
-// - It's not always clear which kernel is vectorized and which one isn't.
-// - The functions like _use_vectorized_kernel_cond() should be renamed and
-//   their description updated, because they're not the only "fork" in the
-//   code-path where a choice is made between a vectorized kernel vs a
-//   non-vectorized one. See e.g. upsample_bilinear2d_kernel_impl() where we
-//   already make a similar check, before the one in
-//   _use_vectorized_kernel_cond().
 // - It's not always clear which code is part of a "separable interpolation"
 //   code-path.
 // - Some names need to be more specific. For example
-//   "cpu_upsample_generic_aa()" looks like a super generic name, but the function
-//   is instead fairly specific - we need to make that clearer.
-// - Some functions have a "aa" suffix but it doesn't mean that they only
-//   support antialias. Some of them also support antialias=False now.
-// - Various comments are outdated. Case in point: the one just below about the
-//   `Interpolate` struct being used for cpu_upsample_linear:
-//   cpu_upsample_linear doesn't exist anymore, and these structs are used for
-//   various modes, *not* just linear.
-// - It'd be useful to document how interpolation works in general, and in particular state explicitly:
+//   "cpu_upsample_generic_separable()" looks like a super generic name, but the
+//   function is instead fairly specific - we need to make that clearer.
+// - It'd be useful to document how interpolation works in general, and in
+//   particular state explicitly:
 //   - that the weights and indices across a given dimension are the same for
 //     all pixels (hence the benefit of pre-computing them)
 //   - that it can be "separated", i.e. we can do the horizontal pass and the
 //     vertical pass independently (and that some kernels are written this way,
 //     while some aren't.)
-// - we can probably remove the template over index_t, because it's always
-//   hard-coded as int64_t
 
 
-// Helper structs and methods for cpu_upsample_linear
-//
-// Interpolation methods that used below are separable, and as such we can compute the interpolation
-// independently per dimension in a recursive way. Please, refer to #10482 for more context.
+// Helper structs and methods for cpu_upsample_generic
 //
 // Interpolation structure to compute output value in n-dimensional case.
 // - recursively compute interpolated output for each dimension
 // - we rely a lot on compiler's code optimization such that implemented operations
 //   can be automatically factorized and vectorized using SSE and AVX2
-template <int n, typename scalar_t, typename opmath_t, typename index_t, int interp_size>
+template <int n, typename scalar_t, typename opmath_t, int interp_size>
 struct Interpolate {
     static inline opmath_t eval(char* src, char** data, const int64_t* strides, int64_t i) {
-      index_t ids = *(index_t*)&data[0][i * strides[0]];
+      int64_t ids = *(int64_t*)&data[0][i * strides[0]];
       opmath_t wts = *(scalar_t*)&data[1][i * strides[1]];
-      opmath_t t = Interpolate<n - 1, scalar_t, opmath_t, index_t, interp_size>::eval(src + ids, &data[2 * interp_size], &strides[2 * interp_size], i);
+      opmath_t t = Interpolate<n - 1, scalar_t, opmath_t, interp_size>::eval(src + ids, &data[2 * interp_size], &strides[2 * interp_size], i);
       opmath_t output = t * wts;
       for (const auto j : c10::irange(1, interp_size)) {
-        ids = *(index_t*)&data[2 * j + 0][i * strides[2 * j + 0]];
+        ids = *(int64_t*)&data[2 * j + 0][i * strides[2 * j + 0]];
         wts = *(scalar_t*)&data[2 * j + 1][i * strides[2 * j + 1]];
-        t = Interpolate<n - 1, scalar_t, opmath_t, index_t, interp_size>::eval(src + ids, &data[2 * interp_size], &strides[2 * interp_size], i);
+        t = Interpolate<n - 1, scalar_t, opmath_t, interp_size>::eval(src + ids, &data[2 * interp_size], &strides[2 * interp_size], i);
         output += t * wts;
       }
       return output;
   }
 };
 
-template <typename scalar_t, typename opmath_t, typename index_t, int interp_size>
-struct Interpolate<1, scalar_t, opmath_t, index_t, interp_size> {
+template <typename scalar_t, typename opmath_t, int interp_size>
+struct Interpolate<1, scalar_t, opmath_t, interp_size> {
     static inline opmath_t eval(char* src, char** data, const int64_t* strides, int64_t i) {
-      index_t ids = *(index_t*)&data[0][i * strides[0]];
+      int64_t ids = *(int64_t*)&data[0][i * strides[0]];
       opmath_t wts = *(scalar_t*)&data[1][i * strides[1]];
       opmath_t t = *(scalar_t *)&src[ids];
       opmath_t output = t * wts;
       for (const auto j : c10::irange(1, interp_size)) {
-        ids = *(index_t*)&data[2 * j + 0][i * strides[2 * j + 0]];
+        ids = *(int64_t*)&data[2 * j + 0][i * strides[2 * j + 0]];
         wts = *(scalar_t*)&data[2 * j + 1][i * strides[2 * j + 1]];
         t = *(scalar_t *)&src[ids];
         output += t * wts;
@@ -108,18 +91,18 @@ struct Interpolate<1, scalar_t, opmath_t, index_t, interp_size> {
     }
 };
 
-template <int n, typename scalar_t, typename opmath_t, typename index_t>
-struct Interpolate<n, scalar_t, opmath_t, index_t, 1> {
+template <int n, typename scalar_t, typename opmath_t>
+struct Interpolate<n, scalar_t, opmath_t, 1> {
     static inline opmath_t eval(char* src, char** data, const int64_t* strides, int64_t i) {
-      index_t ids = *(index_t*)&data[0][i * strides[0]];
-      return Interpolate<n - 1, scalar_t, opmath_t, index_t, 1>::eval(src + ids, &data[2], &strides[2], i);
+      int64_t ids = *(int64_t*)&data[0][i * strides[0]];
+      return Interpolate<n - 1, scalar_t, opmath_t, 1>::eval(src + ids, &data[2], &strides[2], i);
   }
 };
 
-template <typename scalar_t, typename opmath_t, typename index_t>
-struct Interpolate<1, scalar_t, opmath_t, index_t, 1> {
+template <typename scalar_t, typename opmath_t>
+struct Interpolate<1, scalar_t, opmath_t, 1> {
     static inline opmath_t eval(char* src, char** data, const int64_t* strides, int64_t i) {
-      index_t ids = *(index_t*)&data[0][i * strides[0]];
+      int64_t ids = *(int64_t*)&data[0][i * strides[0]];
       return *(scalar_t *)&src[ids];
     }
 };
@@ -127,28 +110,28 @@ struct Interpolate<1, scalar_t, opmath_t, index_t, 1> {
 // There is an unexpected 2x slowdown for upsample_trilinear3d channels_first
 // for both 1 and 6 threads. We have to specialize this case as below:
 // Once the issue is fixed we can keep generic implementation and remove:
-// struct Interpolate<n, scalar_t, index_t, 2> and
-// struct Interpolate<1, scalar_t, index_t, 2>
-template <int n, typename scalar_t, typename opmath_t, typename index_t>
-struct Interpolate<n, scalar_t, opmath_t, index_t, 2> {
+// struct Interpolate<n, scalar_t, opmath_t, 2> and
+// struct Interpolate<1, scalar_t, opmath_t, 2>
+template <int n, typename scalar_t, typename opmath_t>
+struct Interpolate<n, scalar_t, opmath_t, 2> {
     static inline opmath_t eval(char* src, char** data, const int64_t* strides, int64_t i) {
-        index_t i0 = *(index_t*)&data[0][i * strides[0]];
-        index_t i1 = *(index_t*)&data[2][i * strides[2]];
+        int64_t i0 = *(int64_t*)&data[0][i * strides[0]];
+        int64_t i1 = *(int64_t*)&data[2][i * strides[2]];
         opmath_t w0 = *(scalar_t *)&data[1][i * strides[1]];
         opmath_t w1 = *(scalar_t *)&data[3][i * strides[3]];
 
-        opmath_t t0 = Interpolate<n - 1, scalar_t, opmath_t, index_t, 2>::eval(src + i0, &data[4], &strides[4], i);
-        opmath_t t1 = Interpolate<n - 1, scalar_t, opmath_t, index_t, 2>::eval(src + i1, &data[4], &strides[4], i);
+        opmath_t t0 = Interpolate<n - 1, scalar_t, opmath_t, 2>::eval(src + i0, &data[4], &strides[4], i);
+        opmath_t t1 = Interpolate<n - 1, scalar_t, opmath_t, 2>::eval(src + i1, &data[4], &strides[4], i);
 
         return t0 * w0 + t1 * w1;
   }
 };
 
-template <typename scalar_t, typename opmath_t, typename index_t>
-struct Interpolate<1, scalar_t, opmath_t, index_t, 2> {
+template <typename scalar_t, typename opmath_t>
+struct Interpolate<1, scalar_t, opmath_t, 2> {
     static inline opmath_t eval(char* src, char** data, const int64_t* strides, int64_t i) {
-        index_t i0 = *(index_t*)&data[0][i * strides[0]];
-        index_t i1 = *(index_t*)&data[2][i * strides[2]];
+        int64_t i0 = *(int64_t*)&data[0][i * strides[0]];
+        int64_t i1 = *(int64_t*)&data[2][i * strides[2]];
         opmath_t w0 = *(scalar_t *)&data[1][i * strides[1]];
         opmath_t w1 = *(scalar_t *)&data[3][i * strides[3]];
         opmath_t t0 = *(scalar_t *)&src[i0];
@@ -157,24 +140,24 @@ struct Interpolate<1, scalar_t, opmath_t, index_t, 2> {
     }
 };
 
-template <int n, typename scalar_t, typename index_t, int interp_size>
+template <int n, typename scalar_t, int interp_size>
 inline scalar_t interpolate(char* src, char** data, const int64_t* strides, int64_t i) {
   using opmath_t = at::opmath_type<scalar_t>;
-  return Interpolate<n, scalar_t, opmath_t, index_t, interp_size>::eval(src, data, strides, i);
+  return Interpolate<n, scalar_t, opmath_t, interp_size>::eval(src, data, strides, i);
 }
 
-template <typename scalar_t, typename index_t>
-inline scalar_t interpolate_aa_single_dim_zero_strides(
+template <typename scalar_t>
+inline scalar_t interpolate_single_dim_zero_strides(
     char* src,
     char** data,
-    const index_t ids_stride) {
-  const index_t ids_min = *(index_t*)&data[0][0];
-  const index_t ids_size = *(index_t*)&data[1][0];
+    const int64_t ids_stride) {
+  const int64_t ids_min = *(int64_t*)&data[0][0];
+  const int64_t ids_size = *(int64_t*)&data[1][0];
 
   char* src_min = src + ids_min;
 
   scalar_t t = *(scalar_t*)&src_min[0];
-  index_t wts_idx = *(index_t*)&data[4][0];
+  int64_t wts_idx = *(int64_t*)&data[4][0];
   scalar_t* wts_ptr = (scalar_t*)&data[3][wts_idx];
   scalar_t wts = wts_ptr[0];
 
@@ -187,20 +170,20 @@ inline scalar_t interpolate_aa_single_dim_zero_strides(
   return output;
 }
 
-template <typename scalar_t, typename index_t>
-inline scalar_t interpolate_aa_single_dim(
+template <typename scalar_t>
+inline scalar_t interpolate_single_dim(
     char* src,
     char** data,
     const int64_t* strides,
     int64_t i,
-    const index_t ids_stride) {
-  index_t ids_min = *(index_t*)&data[0][i * strides[0]];
-  index_t ids_size = *(index_t*)&data[1][i * strides[1]];
+    const int64_t ids_stride) {
+  int64_t ids_min = *(int64_t*)&data[0][i * strides[0]];
+  int64_t ids_size = *(int64_t*)&data[1][i * strides[1]];
 
   char* src_min = src + ids_min;
 
   scalar_t t = *(scalar_t*)&src_min[0];
-  index_t wts_idx = *(index_t*)&data[4][i * strides[4]];
+  int64_t wts_idx = *(int64_t*)&data[4][i * strides[4]];
   scalar_t* wts_ptr = (scalar_t*)&data[3][wts_idx];
   scalar_t wts = wts_ptr[0];
 
@@ -222,11 +205,11 @@ inline bool is_zero_stride(const int64_t* strides) {
   return output;
 }
 
-template <typename scalar_t, typename index_t, int interp_size>
+template <typename scalar_t, int interp_size>
 inline bool is_contiguous_stride(const int64_t* strides) {
-  bool output = (strides[0] == sizeof(index_t)) && (strides[1] == sizeof(scalar_t));
+  bool output = (strides[0] == sizeof(int64_t)) && (strides[1] == sizeof(scalar_t));
   for (int i=2; i<2 * interp_size; i+=2) {
-    output &= (strides[i] == sizeof(index_t)) && (strides[i + 1] == sizeof(scalar_t));
+    output &= (strides[i] == sizeof(int64_t)) && (strides[i + 1] == sizeof(scalar_t));
   }
   return output;
 }
@@ -240,7 +223,7 @@ inline bool is_contiguous_stride(const int64_t* strides) {
 //   dimension should be non zero.
 //
 // Unit check of the recursion is to verify whether 4 strides for one interpolated dimension are either zero,
-// see method is_zero_stride, or (sizeof(index_t), sizeof(scalar_t), sizeof(index_t), sizeof(scalar_t)), see
+// see method is_zero_stride, or (sizeof(int64_t), sizeof(scalar_t), sizeof(int64_t), sizeof(scalar_t)), see
 // method is_contiguous_stride.
 //
 // In practice, we have the following cases:
@@ -257,49 +240,49 @@ inline bool is_contiguous_stride(const int64_t* strides) {
 // strides=(0,  0,  0,  0,  0,  0,  0,  0, ..., 0,  0,  0,  0)
 //
 // Using these methods we can hint the compiler to factorize constant indices and weights
-// in cpu_upsample_linear method
-template <int N, int non_zero_stride_dim, typename scalar_t, typename index_t, int interp_size>
+// in cpu_upsample_generic
+template <int N, int non_zero_stride_dim, typename scalar_t, int interp_size>
 struct CheckAlmostAllZeroStrides {
   static inline bool eval(const int64_t* strides) {
     // N is dim index: N -> dim0, N-1 -> dim1, ...
     // non_zero_stride_dim should be out_dims - dim
     bool output = false;
     if constexpr (N == non_zero_stride_dim) {
-      output = is_contiguous_stride<scalar_t, index_t, interp_size>(strides);
+      output = is_contiguous_stride<scalar_t, interp_size>(strides);
     } else {
       output = is_zero_stride<2 * interp_size>(strides);
     }
     return output &&
-      CheckAlmostAllZeroStrides<N - 1, non_zero_stride_dim, scalar_t, index_t, interp_size>::eval(
+      CheckAlmostAllZeroStrides<N - 1, non_zero_stride_dim, scalar_t, interp_size>::eval(
         &strides[2 * interp_size]);
   }
 };
 
-template <int non_zero_stride_dim, typename scalar_t, typename index_t, int interp_size>
-struct CheckAlmostAllZeroStrides<0, non_zero_stride_dim, scalar_t, index_t, interp_size> {
+template <int non_zero_stride_dim, typename scalar_t, int interp_size>
+struct CheckAlmostAllZeroStrides<0, non_zero_stride_dim, scalar_t, interp_size> {
   static inline bool eval(const int64_t* /*strides*/) {
     return true;
   }
 };
 
-template <int n, int s, typename scalar_t, typename index_t, int interp_size>
+template <int n, int s, typename scalar_t, int interp_size>
 inline bool check_almost_all_zero_stride(const int64_t* strides) {
-  return CheckAlmostAllZeroStrides<n, s, scalar_t, index_t, interp_size>::eval(strides);
+  return CheckAlmostAllZeroStrides<n, s, scalar_t, interp_size>::eval(strides);
 }
 
 // Helper method to compute interpolation for nearest, linear, cubic modes
-template <typename scalar_t, typename index_t, int out_ndims, int interp_size>
+template <typename scalar_t, int out_ndims, int interp_size>
 inline void basic_loop(char** data, const int64_t* strides, int64_t n) {
   char* dst = data[0];
   char* src = data[1];
   for (const auto i : c10::irange(n)) {
-    *(scalar_t*)&dst[i * strides[0]] = interpolate<out_ndims, scalar_t, index_t, interp_size>(
+    *(scalar_t*)&dst[i * strides[0]] = interpolate<out_ndims, scalar_t, interp_size>(
         src + i * strides[1], &data[2], &strides[2], i);
   }
 }
 
 template <typename scalar_t>
-inline void basic_loop_aa_vertical(
+inline void basic_loop_vertical(
     char** data,
     const int64_t* strides,
     int64_t n,
@@ -311,13 +294,13 @@ inline void basic_loop_aa_vertical(
 
   for (const auto i : c10::irange(n)) {
     *(scalar_t*)&dst[i * strides[0]] =
-        interpolate_aa_single_dim_zero_strides<scalar_t, int64_t>(
+        interpolate_single_dim_zero_strides<scalar_t>(
             src + i * strides[1], &data[2], ids_stride);
   }
 }
 
 template <>
-inline void basic_loop_aa_vertical<uint8_t>(
+inline void basic_loop_vertical<uint8_t>(
     char** data,
     const int64_t* strides,
     int64_t n,
@@ -355,7 +338,7 @@ inline void basic_loop_aa_vertical<uint8_t>(
 }
 
 template <typename scalar_t>
-inline void basic_loop_aa_horizontal(
+inline void basic_loop_horizontal(
     char** data,
     const int64_t* strides,
     int64_t n,
@@ -368,20 +351,20 @@ inline void basic_loop_aa_horizontal(
   if (strides[1] == 0) {
     for (const auto i : c10::irange(n)) {
       *(scalar_t*)&dst[i * strides[0]] =
-          interpolate_aa_single_dim<scalar_t, int64_t>(
+          interpolate_single_dim<scalar_t>(
               src, &data[2], &strides[2], i, ids_stride);
     }
   } else {
     for (const auto i : c10::irange(n)) {
       *(scalar_t*)&dst[i * strides[0]] =
-          interpolate_aa_single_dim<scalar_t, int64_t>(
+          interpolate_single_dim<scalar_t>(
               src + i * strides[1], &data[2], &strides[2], i, ids_stride);
     }
   }
 }
 
 template <>
-inline void basic_loop_aa_horizontal<uint8_t>(
+inline void basic_loop_horizontal<uint8_t>(
     char** data,
     const int64_t* strides,
     int64_t n,
@@ -432,7 +415,7 @@ inline void basic_loop_aa_horizontal<uint8_t>(
 // output_DN[a] = interpolate(input_DN[a], w_DN[a], input_DN[a+1], w_DN[a+1], ...)
 // and i - dimension index and a - linear index for spatial coordinates
 //
-// The recursive call is implemented with InterpLinear struct using template for
+// The recursive call is implemented with the Interpolate struct using template for
 // the loop unrolling on compile time.
 template <typename scalar_t, int out_ndims, int interp_size>
 void cpu_upsample_generic(at::TensorIterator& iter)
@@ -441,16 +424,16 @@ void cpu_upsample_generic(at::TensorIterator& iter)
     // special-cases to let the compiler apply compile-time input-specific optimizations
     if ((strides[0] == sizeof(scalar_t) && (strides[1] == 0) &&
         // NOLINTNEXTLINE(bugprone-branch-clone)
-        check_almost_all_zero_stride<out_ndims, 1, scalar_t, int64_t, interp_size>(&strides[2]))) {
+        check_almost_all_zero_stride<out_ndims, 1, scalar_t, interp_size>(&strides[2]))) {
       // contiguous channels-first case
-      basic_loop<scalar_t, int64_t, out_ndims, interp_size>(data, strides, n);
+      basic_loop<scalar_t, out_ndims, interp_size>(data, strides, n);
     } else if ((strides[0] == sizeof(scalar_t) && (strides[1] == sizeof(scalar_t)) &&
-               check_almost_all_zero_stride<out_ndims, -1, scalar_t, int64_t, interp_size>(&strides[2]))) {
+               check_almost_all_zero_stride<out_ndims, -1, scalar_t, interp_size>(&strides[2]))) {
       // contiguous channels-last case
-      basic_loop<scalar_t, int64_t, out_ndims, interp_size>(data, strides, n);
+      basic_loop<scalar_t, out_ndims, interp_size>(data, strides, n);
     } else {
       // fallback
-      basic_loop<scalar_t, int64_t, out_ndims, interp_size>(data, strides, n);
+      basic_loop<scalar_t, out_ndims, interp_size>(data, strides, n);
     }
   };
   iter.for_each(loop);
@@ -709,10 +692,10 @@ void cpu_upsample_linear_channels_last(
   };
 
   if (ndim == 4) {
-    // upsample nearest 2d
+    // bilinear 2d
     at::parallel_for(0, num_batches, at::internal::GRAIN_SIZE / output_slice_size / 4, loop2d);
   } else {
-    // upsample nearest 3d
+    // trilinear 3d
     TORCH_INTERNAL_ASSERT(ndim == 5);
     at::parallel_for(0, num_batches, at::internal::GRAIN_SIZE / output_slice_size / 8, loop3d);
   }
@@ -948,7 +931,7 @@ struct HelperInterpBase {
   weights as double, but then convert them to int16 via some conversion logic
   detailed below. This allows us to compute all interpolation operation (sum of
   multiplications) as ints instead of floats. The result is converted back into
-  uint8 in basic_loop_aa_horizontal<uint8_t> (and vertical)
+  uint8 in basic_loop_horizontal<uint8_t> (and vertical)
 
   In essence the idea is to avoid a multiplication between a float (the
   weight) and an int (the pixel value) and instead run a multiplication between
@@ -1495,19 +1478,19 @@ void upsample_generic_Nd_kernel_impl(
 }
 
 template <typename scalar_t, bool is_horizontal>
-void cpu_upsample_generic_aa(at::TensorIterator& iter, unsigned int weights_precision) {
+void cpu_upsample_generic_separable(at::TensorIterator& iter, unsigned int weights_precision) {
 
   auto loop = [&](char** data, const int64_t* strides, int64_t n) {
     if constexpr (is_horizontal) {
 
       // Strides are : X 0 | 8 8 8 0 8  (Channels first)
       // Strides are : X X | 0 0 0 0 0  (Channels last)
-      basic_loop_aa_horizontal<scalar_t>(data, strides, n, weights_precision);
+      basic_loop_horizontal<scalar_t>(data, strides, n, weights_precision);
     } else {
       // Strides are : X Y | 0 0 0 0 0 (Channels first)
       // Strides are : X X | 0 0 0 0 0 (Channels last)
       // upsampling data between contiguous dimensions (aka vertical resampling)
-      basic_loop_aa_vertical<scalar_t>(data, strides, n, weights_precision);
+      basic_loop_vertical<scalar_t>(data, strides, n, weights_precision);
     }
   };
 
@@ -1577,7 +1560,7 @@ void _separable_upsample_generic_Nd_kernel_impl_single_dim(
 
   AT_DISPATCH_FLOATING_TYPES_AND(
       at::ScalarType::Byte, iter.dtype(), "upsample_generic_Nd_aa", [&] {
-        cpu_upsample_generic_aa<scalar_t, is_horizontal>(iter, weights_precision);
+        cpu_upsample_generic_separable<scalar_t, is_horizontal>(iter, weights_precision);
       });
 }
 
@@ -1676,22 +1659,24 @@ void _upsample_nearest_exact1d_kernel_impl(
     output, input, false, {scales_w});
 }
 
-int _use_vectorized_kernel_cond_2d(
+int _use_channels_last_kernel_2d(
     const Tensor& output,
     const Tensor& input) {
-      // This condition is used to know whether we should dispatch to a vectorized
-      // kernel, or to the more general upsample_generic_Nd_kernel_impl(). For now,
-      // the vectorized kernels are only optimized for channels_last and when C >= 4
-      // (shape = NCHW). For a very wide range of use-cases (typically image or mask
-      // resizing where we have C < 4), using upsample_generic_Nd_kernel_impl() is
-      // actually faster. On top of that, benchmarks showed that this also depends on
-      // the *output* size (output_H + output_W), for both upsampling and
-      // downsampling. The current 128 threshold was determined through benchmarks.
+      // This condition is used to know whether we should dispatch to a
+      // channels-last-optimized kernel, or to the more general
+      // upsample_generic_Nd_kernel_impl(). For now, the channels-last kernels
+      // are only optimized for channels_last and when C >= 4 (shape = NCHW).
+      // For a very wide range of use-cases (typically image or mask resizing
+      // where we have C < 4), using upsample_generic_Nd_kernel_impl() is
+      // actually faster. On top of that, benchmarks showed that this also
+      // depends on the *output* size (output_H + output_W), for both
+      // upsampling and downsampling. The current 128 threshold was determined
+      // through benchmarks.
       return ((input.is_contiguous(at::MemoryFormat::ChannelsLast)) && (input.size(1) > 3)) || ((output.size(-2) + output.size(-1)) <= 128);
 }
 
-int _use_vectorized_kernel_cond_3d(
-    // Similar to _use_vectorized_kernel_cond_2d() but for 3d resampling (e.g. videos)
+int _use_channels_last_kernel_3d(
+    // Similar to _use_channels_last_kernel_2d() but for 3d resampling (e.g. videos)
     // Note that unlike the 2d case, this is not subject to small output size
     // overhead - hence the absence of the 128 threshold in the condition.
     const Tensor& output,
@@ -1705,7 +1690,7 @@ void upsample_nearest2d_kernel_impl(
     const Tensor& input,
     std::optional<double> scales_h,
     std::optional<double> scales_w) {
-  if (_use_vectorized_kernel_cond_2d(output, input)) {
+  if (_use_channels_last_kernel_2d(output, input)) {
     AT_DISPATCH_FLOATING_TYPES_AND3(kByte, kBFloat16, kHalf,
         input.scalar_type(), "upsample_nearest2d_channels_last", [&] {
       cpu_upsample_nearest_channels_last<scalar_t, scale_t, nearest_idx>(output, input, {scales_h, scales_w});
@@ -1721,7 +1706,7 @@ void _upsample_nearest_exact2d_kernel_impl(
     const Tensor& input,
     std::optional<double> scales_h,
     std::optional<double> scales_w) {
-  if (_use_vectorized_kernel_cond_2d(output, input)) {
+  if (_use_channels_last_kernel_2d(output, input)) {
     AT_DISPATCH_FLOATING_TYPES_AND3(kByte, kBFloat16, kHalf, input.scalar_type(), "upsample_nearest2d_channels_last", [&] {
       cpu_upsample_nearest_channels_last<scalar_t, scale_t, nearest_exact_idx>(output, input, {scales_h, scales_w});
     });
@@ -1737,7 +1722,7 @@ void upsample_nearest3d_kernel_impl(
     std::optional<double> scales_d,
     std::optional<double> scales_h,
     std::optional<double> scales_w) {
-  if (_use_vectorized_kernel_cond_3d(output, input)) {
+  if (_use_channels_last_kernel_3d(output, input)) {
     AT_DISPATCH_FLOATING_TYPES_AND3(kByte, kBFloat16, kHalf,
         input.scalar_type(), "upsample_nearest3d_channels_last", [&] {
       cpu_upsample_nearest_channels_last<scalar_t, scale_t, nearest_idx>(output, input, {scales_d, scales_h, scales_w});
@@ -1754,7 +1739,7 @@ void _upsample_nearest_exact3d_kernel_impl(
     std::optional<double> scales_d,
     std::optional<double> scales_h,
     std::optional<double> scales_w) {
-  if (_use_vectorized_kernel_cond_3d(output, input)) {
+  if (_use_channels_last_kernel_3d(output, input)) {
     AT_DISPATCH_FLOATING_TYPES_AND3(kByte, kBFloat16, kHalf, input.scalar_type(), "upsample_nearest3d_channels_last", [&] {
       cpu_upsample_nearest_channels_last<scalar_t, scale_t, nearest_exact_idx>(output, input, {scales_d, scales_h, scales_w});
     });
@@ -1781,12 +1766,12 @@ void upsample_bilinear2d_kernel_impl_float(
     std::optional<double> scales_h,
     std::optional<double> scales_w) {
 
-  // See note above about _use_vectorized_kernel_cond_2d(output, input). The extra cond is present
+  // See note above about _use_channels_last_kernel_2d(output, input). The extra cond is present
   // because benchmarks showed that with only 1 thread, images (C == 3) were
-  // slightly faster with the vectorized kernel than with the generic one.
+  // slightly faster with the channels-last kernel than with the generic one.
   // That's not the case for masks though (C == 1), which strongly benefit from
   // using the generic kernel.
-  if ((_use_vectorized_kernel_cond_2d(output, input)) || (at::get_num_threads() == 1 && input.size(1) == 3)) {
+  if ((_use_channels_last_kernel_2d(output, input)) || (at::get_num_threads() == 1 && input.size(1) == 3)) {
     AT_DISPATCH_FLOATING_TYPES_AND2(kBFloat16, kHalf, input.scalar_type(), "upsample_bilinear2d_channels_last", [&] {
       cpu_upsample_linear_channels_last<scalar_t, scale_t>(output, input, align_corners, {scales_h, scales_w});
     });
@@ -1862,7 +1847,7 @@ void upsample_trilinear3d_kernel_impl(
     std::optional<double> scales_d,
     std::optional<double> scales_h,
     std::optional<double> scales_w) {
-  if ((_use_vectorized_kernel_cond_3d(output, input))) {
+  if ((_use_channels_last_kernel_3d(output, input))) {
     AT_DISPATCH_FLOATING_TYPES_AND2(kBFloat16, kHalf, input.scalar_type(), "upsample_trilinear3d_channels_last", [&] {
       cpu_upsample_linear_channels_last<scalar_t, scale_t>(output, input, align_corners, {scales_d, scales_h, scales_w});
     });
