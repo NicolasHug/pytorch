@@ -24,34 +24,21 @@ namespace {
 
 using scale_t = std::vector<std::optional<double>>;
 
-// TODO: this file could benefit from a global renaming of its functions /
-// classes and terms, as well as from adding more comments. In particular:
-// - It's not obvious that despite their names (and the file name), all these
-//   kernels don't just do upsampling: they do general interpolation, i.e. they
-//   also all support downscaling.
-// - the term "horizontal" or "within dims" or "contiguous dim" refers to the
-//   last dimension.
-//   It's not specific to 2D images and applies to 3D (and 1D??) inputs as well.
-//   Similarly "vertical" or "across dims" refers to all dims that aren't the
-//   last one. In other kernels these are also referred to as "zero-stride" and
-//   "non-zero-stride" - we should unify all this.
-// - the terms "zero-stride" and "non-zero strides" refer to the weights and
-//   indices, not to the contiguity of input or output
-// - It's not always clear which code is part of a "separable interpolation"
-//   code-path.
-// - Some names need to be more specific. For example
-//   "cpu_upsample_generic_separable()" looks like a super generic name, but the
-//   function is instead fairly specific - we need to make that clearer.
-// - It'd be useful to document how interpolation works in general, and in
-//   particular state explicitly:
-//   - that the weights and indices across a given dimension are the same for
-//     all pixels (hence the benefit of pre-computing them)
-//   - that it can be "separated", i.e. we can do the horizontal pass and the
-//     vertical pass independently (and that some kernels are written this way,
-//     while some aren't.)
 
-
-// Helper structs and methods for cpu_upsample_generic
+// ---- Recursive multi-dim interpolation (TensorIterator-based) ----
+//
+// Used by: nearest, linear, bilinear (float), cubic (float), trilinear.
+// Processes all spatial dims in a single TensorIterator pass via the recursive
+// Interpolate struct.
+//
+// Call chain:
+//   upsample_generic_Nd_kernel_impl
+//     -> upsample_generic
+//       -> basic_loop
+//         -> interpolate
+//           -> Interpolate (recursive struct)
+//
+// Helper structs and methods for upsample_generic
 //
 // Interpolation structure to compute output value in n-dimensional case.
 // - recursively compute interpolated output for each dimension
@@ -146,6 +133,32 @@ inline scalar_t interpolate(char* src, char** data, const int64_t* strides, int6
   return Interpolate<n, scalar_t, opmath_t, interp_size>::eval(src, data, strides, i);
 }
 
+// ---- Separable single-dim interpolation ----
+//
+// Used by: bilinear/bicubic with antialias=True, and bilinear/bicubic uint8
+// (as fallback when AVX isn't supported).
+// Processes one spatial dimension at a time. The outer loop over dimensions
+// is in separable_upsample_generic_Nd_kernel_impl.
+//
+// Call chain:
+//   separable_upsample_generic_Nd_kernel_impl  (loops over dims)
+//     -> _separable_upsample_generic_Nd_kernel_impl_single_dim
+//       -> upsample_single_dim
+//         -> basic_loop_horizontal  (for last spatial dim, i.e. W)
+//           -> interpolate_single_dim
+//         -> basic_loop_vertical  (for other spatial dims, e.g. H, D)
+//           -> interpolate_single_dim_zero_strides
+//
+// "horizontal" vs "vertical":
+//   "horizontal" means we're interpolating along the last spatial dimension
+//   (W in NCHW, W in NCDHW).
+//   "vertical" means we're interpolating along any other spatial dimension.
+//   For vertical dims, the TensorIterator's inner loop runs along the last
+//   spatial dim, so the pre-computed indices/weights for the interpolated dim
+//   are the same for all elements in the inner loop (zero strides).
+//   basic_loop_vertical exploits this by reading indices/weights at offset 0
+//   instead of i * strides[k].
+
 template <typename scalar_t>
 inline scalar_t interpolate_single_dim_zero_strides(
     char* src,
@@ -217,6 +230,10 @@ inline bool is_contiguous_stride(const int64_t* strides) {
 // Helper class to recursively check if all input strides corresponding to interpolated dimensions
 // are equal zero except on a single dimension.
 //
+// Note: "zero-stride" and "non-zero stride" here refer to the strides of the
+// pre-computed indices and weights tensors (extra TensorIterator inputs), NOT
+// to the contiguity of the input or output data tensors.
+//
 // Inputs: array of strides of size N, non_zero_stride_dim which can be -1, 0, 1, 2, ...
 //   if non_zero_stride_dim, we check that all strides are equal zero, otherwise
 //   4 strides corresponding to the strides for index_0, weight_0, index_1 and weight_1 for non_zero_stride_dim
@@ -240,7 +257,7 @@ inline bool is_contiguous_stride(const int64_t* strides) {
 // strides=(0,  0,  0,  0,  0,  0,  0,  0, ..., 0,  0,  0,  0)
 //
 // Using these methods we can hint the compiler to factorize constant indices and weights
-// in cpu_upsample_generic
+// in upsample_generic
 template <int N, int non_zero_stride_dim, typename scalar_t, int interp_size>
 struct CheckAlmostAllZeroStrides {
   static inline bool eval(const int64_t* strides) {
@@ -418,7 +435,7 @@ inline void basic_loop_horizontal<uint8_t>(
 // The recursive call is implemented with the Interpolate struct using template for
 // the loop unrolling on compile time.
 template <typename scalar_t, int out_ndims, int interp_size>
-void cpu_upsample_generic(at::TensorIterator& iter)
+void upsample_generic(at::TensorIterator& iter)
 {
   auto loop = [&](char** data, const int64_t* strides, int64_t n) {
     // special-cases to let the compiler apply compile-time input-specific optimizations
@@ -440,7 +457,7 @@ void cpu_upsample_generic(at::TensorIterator& iter)
 }
 
 template <typename scalar_t, typename scale_type, nearest_idx_fn_t nearest_idx_fn>
-void cpu_upsample_nearest_channels_last(
+void upsample_nearest_channels_last(
     const Tensor& output_,
     const Tensor& input_,
     const scale_type& scales) {
@@ -545,7 +562,7 @@ inline VecType<scalar_t> interpolate(const scalar_t* t, accscalar_t w, Args... a
 }
 
 template <typename scalar_t, typename scale_type>
-void cpu_upsample_linear_channels_last(
+void upsample_linear_channels_last(
     const Tensor& output_,
     const Tensor& input_,
     bool align_corners,
@@ -1466,19 +1483,19 @@ void upsample_generic_Nd_kernel_impl(
         kBFloat16, kHalf, iter.dtype(), "upsample_generic_Nd", [&] {
         // MSVC can not catch constexpr int interp_size here
         constexpr int mode = F::interp_size;
-        cpu_upsample_generic<scalar_t, out_ndims, mode>(iter);
+        upsample_generic<scalar_t, out_ndims, mode>(iter);
     });
   } else {
     AT_DISPATCH_FLOATING_TYPES_AND3(kByte, kBFloat16, kHalf,
         iter.dtype(), "upsample_generic_Nd", [&] {
         constexpr int mode = F::interp_size;
-        cpu_upsample_generic<scalar_t, out_ndims, mode>(iter);
+        upsample_generic<scalar_t, out_ndims, mode>(iter);
     });
   }
 }
 
 template <typename scalar_t, bool is_horizontal>
-void cpu_upsample_generic_separable(at::TensorIterator& iter, unsigned int weights_precision) {
+void upsample_single_dim(at::TensorIterator& iter, unsigned int weights_precision) {
 
   auto loop = [&](char** data, const int64_t* strides, int64_t n) {
     if constexpr (is_horizontal) {
@@ -1489,7 +1506,7 @@ void cpu_upsample_generic_separable(at::TensorIterator& iter, unsigned int weigh
     } else {
       // Strides are : X Y | 0 0 0 0 0 (Channels first)
       // Strides are : X X | 0 0 0 0 0 (Channels last)
-      // upsampling data between contiguous dimensions (aka vertical resampling)
+      // vertical resampling (non-last spatial dims)
       basic_loop_vertical<scalar_t>(data, strides, n, weights_precision);
     }
   };
@@ -1560,7 +1577,7 @@ void _separable_upsample_generic_Nd_kernel_impl_single_dim(
 
   AT_DISPATCH_FLOATING_TYPES_AND(
       at::ScalarType::Byte, iter.dtype(), "upsample_generic_Nd_aa", [&] {
-        cpu_upsample_generic_separable<scalar_t, is_horizontal>(iter, weights_precision);
+        upsample_single_dim<scalar_t, is_horizontal>(iter, weights_precision);
       });
 }
 
@@ -1598,7 +1615,7 @@ void separable_upsample_generic_Nd_kernel_impl(
     }
   }
 
-  // upsampling data within the contiguous dimension (aka horizontal resampling)
+  // Horizontal resampling (last spatial dim, i.e. W)
   interp_dim = 2 + out_ndims - 1;
   if (output_shape[interp_dim] != input_shape[interp_dim]) {
 
@@ -1619,7 +1636,7 @@ void separable_upsample_generic_Nd_kernel_impl(
     temp_input = temp_output;
   }
 
-  // upsampling data between contiguous dimensions (aka vertical resampling)
+  // Vertical resampling (remaining spatial dims, e.g. H, D)
   for (const auto i : c10::irange(1, out_ndims)) {
     interp_dim = 2 + out_ndims - 1 - i;
     if (output_shape[interp_dim] != input_shape[interp_dim]) {
@@ -1693,7 +1710,7 @@ void upsample_nearest2d_kernel_impl(
   if (_use_channels_last_kernel_2d(output, input)) {
     AT_DISPATCH_FLOATING_TYPES_AND3(kByte, kBFloat16, kHalf,
         input.scalar_type(), "upsample_nearest2d_channels_last", [&] {
-      cpu_upsample_nearest_channels_last<scalar_t, scale_t, nearest_idx>(output, input, {scales_h, scales_w});
+      upsample_nearest_channels_last<scalar_t, scale_t, nearest_idx>(output, input, {scales_h, scales_w});
     });
   } else {
     upsample_generic_Nd_kernel_impl<2, scale_t, HelperInterpNearest>(
@@ -1708,7 +1725,7 @@ void _upsample_nearest_exact2d_kernel_impl(
     std::optional<double> scales_w) {
   if (_use_channels_last_kernel_2d(output, input)) {
     AT_DISPATCH_FLOATING_TYPES_AND3(kByte, kBFloat16, kHalf, input.scalar_type(), "upsample_nearest2d_channels_last", [&] {
-      cpu_upsample_nearest_channels_last<scalar_t, scale_t, nearest_exact_idx>(output, input, {scales_h, scales_w});
+      upsample_nearest_channels_last<scalar_t, scale_t, nearest_exact_idx>(output, input, {scales_h, scales_w});
     });
   } else {
     upsample_generic_Nd_kernel_impl<2, scale_t, HelperInterpNearestExact>(
@@ -1725,7 +1742,7 @@ void upsample_nearest3d_kernel_impl(
   if (_use_channels_last_kernel_3d(output, input)) {
     AT_DISPATCH_FLOATING_TYPES_AND3(kByte, kBFloat16, kHalf,
         input.scalar_type(), "upsample_nearest3d_channels_last", [&] {
-      cpu_upsample_nearest_channels_last<scalar_t, scale_t, nearest_idx>(output, input, {scales_d, scales_h, scales_w});
+      upsample_nearest_channels_last<scalar_t, scale_t, nearest_idx>(output, input, {scales_d, scales_h, scales_w});
     });
   } else {
     upsample_generic_Nd_kernel_impl<3, scale_t, HelperInterpNearest>(
@@ -1741,7 +1758,7 @@ void _upsample_nearest_exact3d_kernel_impl(
     std::optional<double> scales_w) {
   if (_use_channels_last_kernel_3d(output, input)) {
     AT_DISPATCH_FLOATING_TYPES_AND3(kByte, kBFloat16, kHalf, input.scalar_type(), "upsample_nearest3d_channels_last", [&] {
-      cpu_upsample_nearest_channels_last<scalar_t, scale_t, nearest_exact_idx>(output, input, {scales_d, scales_h, scales_w});
+      upsample_nearest_channels_last<scalar_t, scale_t, nearest_exact_idx>(output, input, {scales_d, scales_h, scales_w});
     });
   } else {
     upsample_generic_Nd_kernel_impl<3, scale_t, HelperInterpNearestExact>(
@@ -1773,7 +1790,7 @@ void upsample_bilinear2d_kernel_impl_float(
   // using the generic kernel.
   if ((_use_channels_last_kernel_2d(output, input)) || (at::get_num_threads() == 1 && input.size(1) == 3)) {
     AT_DISPATCH_FLOATING_TYPES_AND2(kBFloat16, kHalf, input.scalar_type(), "upsample_bilinear2d_channels_last", [&] {
-      cpu_upsample_linear_channels_last<scalar_t, scale_t>(output, input, align_corners, {scales_h, scales_w});
+      upsample_linear_channels_last<scalar_t, scale_t>(output, input, align_corners, {scales_h, scales_w});
     });
   } else {
     upsample_generic_Nd_kernel_impl<2, scale_t, HelperInterpLinear>(
@@ -1849,7 +1866,7 @@ void upsample_trilinear3d_kernel_impl(
     std::optional<double> scales_w) {
   if ((_use_channels_last_kernel_3d(output, input))) {
     AT_DISPATCH_FLOATING_TYPES_AND2(kBFloat16, kHalf, input.scalar_type(), "upsample_trilinear3d_channels_last", [&] {
-      cpu_upsample_linear_channels_last<scalar_t, scale_t>(output, input, align_corners, {scales_d, scales_h, scales_w});
+      upsample_linear_channels_last<scalar_t, scale_t>(output, input, align_corners, {scales_d, scales_h, scales_w});
     });
   } else {
     upsample_generic_Nd_kernel_impl<3, scale_t, HelperInterpLinear>(
@@ -1921,7 +1938,7 @@ template <
     typename scalar_t,
     typename scale_type,
     class F>
-void cpu_upsample_genNd_backward_aa(
+void upsample_genNd_backward_aa(
     const Tensor& grad_input_,
     const Tensor& grad_output_,
     bool align_corners,
@@ -2039,7 +2056,7 @@ void upsample_bilinear2d_aa_backward_kernel_impl(
     std::optional<double> scales_w) {
   AT_DISPATCH_FLOATING_TYPES(
       grad_output.scalar_type(), "upsample_bilinear2d_aa_backward_cpu", [&] {
-        cpu_upsample_genNd_backward_aa<scalar_t, scale_t, HelperInterpLinear>(
+        upsample_genNd_backward_aa<scalar_t, scale_t, HelperInterpLinear>(
             grad_input, grad_output, align_corners, {scales_h, scales_w});
       });
 }
@@ -2052,7 +2069,7 @@ void upsample_bicubic2d_aa_backward_kernel_impl(
     std::optional<double> scales_w) {
   AT_DISPATCH_FLOATING_TYPES(
       grad_output.scalar_type(), "upsample_bicubic2d_aa_backward_cpu", [&] {
-        cpu_upsample_genNd_backward_aa<scalar_t, scale_t, HelperInterpCubic>(
+        upsample_genNd_backward_aa<scalar_t, scale_t, HelperInterpCubic>(
             grad_input, grad_output, align_corners, {scales_h, scales_w});
       });
 }
