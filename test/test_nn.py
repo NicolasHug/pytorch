@@ -10820,6 +10820,96 @@ class TestNNDeviceType(NNTestCase):
         t_out = F.interpolate(t_in, size=(2, 2), mode="bicubic", align_corners=False, antialias=True)
         self.assertEqual(expected_out, t_out)
 
+    @parametrize_test("memory_format", [torch.contiguous_format, torch.channels_last])
+    def test_upsamplingLanczos2d_aa_correctness(self, device, memory_format):
+        t_in = torch.arange(3 * 8 * 8, dtype=torch.float, device=device).reshape(1, 3, 8, 8)
+        t_in = t_in.contiguous(memory_format=memory_format)
+        # This expected result is obtained using PIL.Image.resize
+        # for c in range(3):
+        #   a_in = t_in.numpy()[0, c, ...]
+        #   pil_in = Image.fromarray(a_in)
+        #   pil_out = pil_in.resize((2, 2), resample=Image.LANCZOS)
+        expected_out = torch.tensor([
+            14.267621, 18.097038, 44.902962, 48.732376, 78.267616, 82.097038,
+            108.902962, 112.732384, 142.267624, 146.097031, 172.902969, 176.732376
+        ], device=device, dtype=t_in.dtype).reshape(1, 3, 2, 2)
+        t_out = F.interpolate(t_in, size=(2, 2), mode="lanczos", align_corners=False, antialias=True)
+        self.assertEqual(expected_out, t_out)
+
+    @skipIfMPS
+    @parametrize_test("memory_format", [torch.contiguous_format, torch.channels_last])
+    @parametrize_test("num_channels", [3, 5])
+    @parametrize_test("output_size", [32, 600])
+    @parametrize_test("non_contig", [False, "sliced", "restrided"])
+    @parametrize_test("batch_size", [1, 5])
+    def test_upsamplingLanczos2d_consistency(
+        self,
+        device,
+        memory_format,
+        num_channels,
+        output_size,
+        non_contig,
+        batch_size,
+    ):
+        if torch.device(device).type == "cuda":
+            raise SkipTest("CUDA implementation is not yet supporting uint8")
+
+        torch.manual_seed(0)
+
+        input_ui8 = torch.randint(30, 220, size=(batch_size, num_channels, 400, 400), dtype=torch.uint8, device=device)
+        input_ui8 = input_ui8.contiguous(memory_format=memory_format)
+
+        if non_contig == "sliced":
+            input_ui8 = input_ui8[:, :, 10:-10, 10:-10]
+        elif non_contig == "restrided":
+            input_ui8 = input_ui8[:, :, ::2, ::2]
+
+        input_f32 = input_ui8.float()
+
+        output_f32 = F.interpolate(
+            input_f32, size=(output_size, output_size), mode="lanczos", align_corners=False, antialias=True
+        ).round().clip(0, 255)
+        output_ui8 = F.interpolate(
+            input_ui8, size=(output_size, output_size), mode="lanczos", align_corners=False, antialias=True
+        )
+
+        if non_contig is False:
+            self.assertTrue(input_ui8.is_contiguous(memory_format=memory_format))
+
+        diff = (output_f32 - output_ui8.float()).abs()
+        self.assertLess(diff.max(), 15)
+
+        threshold = 2
+        percent = 3
+        self.assertLess((diff > threshold).float().mean(), percent / 100)
+
+        threshold = 5
+        percent = 1
+        self.assertLess((diff > threshold).float().mean(), percent / 100)
+
+        self.assertLess(diff.mean(), 0.4)
+
+    def test_upsamplingLanczos2d_errors(self, device):
+        # 3D input (1D spatial) not supported
+        x_3d = torch.randn(1, 3, 8, device=device)
+        with self.assertRaisesRegex(ValueError, "4-D tensor"):
+            F.interpolate(x_3d, size=(4,), mode="lanczos", antialias=True)
+
+        # 5D input (3D spatial) not supported
+        x_5d = torch.randn(1, 3, 8, 8, 8, device=device)
+        with self.assertRaisesRegex(ValueError, "4-D tensor"):
+            F.interpolate(x_5d, size=(4, 4, 4), mode="lanczos", antialias=True)
+
+        # antialias=False not supported
+        x_4d = torch.randn(1, 3, 8, 8, device=device)
+        with self.assertRaisesRegex(ValueError, "antialias=True"):
+            F.interpolate(x_4d, size=(4, 4), mode="lanczos", antialias=False)
+
+    def test_upsamplingLanczos2d_identity(self, device):
+        x = torch.randn(1, 3, 8, 8, device=device)
+        out = F.interpolate(x, size=(8, 8), mode="lanczos", align_corners=False, antialias=True)
+        self.assertEqual(x, out)
+
     @onlyCUDA
     def test_upsamplingBicubic2d_many_channels(self, device):
         # Exercises the parallelized batch/channel kernel for small spatial
