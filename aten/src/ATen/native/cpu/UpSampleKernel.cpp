@@ -1427,7 +1427,7 @@ struct HelperInterpLanczos : public HelperInterpBase {
     if (x == 0.0) {
       return 1.0;
     }
-    x = x * M_PI;
+    x = x * c10::pi<scalar_t>;
     return std::sin(x) / x;
   }
 
