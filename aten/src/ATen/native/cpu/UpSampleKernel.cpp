@@ -1420,8 +1420,8 @@ struct HelperInterpLanczos : public HelperInterpBase {
 
   static constexpr int interp_size = 6;
 
-  // Attempt to emulate sinc, matching PIL/Pillow behavior:
-  // https://github.com/python-pillow/Pillow/blob/main/src/libImaging/Resample.c#L64-L86
+  // Taken from
+  // https://github.com/python-pillow/Pillow/blob/8004234d879254cc354935ad42fbb51b1700925e/src/libImaging/Resample.c#L64-L86
   template<typename scalar_t>
   static inline scalar_t sinc_filter(scalar_t x) {
     if (x == 0.0) {
