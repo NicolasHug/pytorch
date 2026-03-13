@@ -394,7 +394,15 @@ class BaseUserFunctionVariable(VariableTracker):
 
     def get_dict_vt(self, tx: "InstructionTranslator") -> "DunderDictVariable":
         if self.dict_vt is None:
-            self.dict_vt = variables.DunderDictVariable.create(tx, self)
+            dict_proxy: dict[str, VariableTracker] = {}
+            if hasattr(self, "fn"):  # Use `.get_function()` instead?
+                dict_proxy = {
+                    name: VariableTracker.build(
+                        tx, value, source=self.source and AttrSource(self.source, name)
+                    )
+                    for name, value in self.fn.__dict__.items()
+                }
+            self.dict_vt = variables.DunderDictVariable.create(tx, self, dict_proxy)
         return self.dict_vt
 
     def call_method(
@@ -2260,7 +2268,12 @@ class SkipFunctionVariable(VariableTracker):
                 )
                 # pyrefly: ignore [implicit-any]
                 hints = []
-            reason = self.reason if self.reason else "<missing reason>"
+            if self.reason:
+                reason = self.reason
+            else:
+                from ..trace_rules import get_skip_reason
+
+                reason = get_skip_reason(self.value)
             unimplemented(
                 gb_type="Attempted to call function marked as skipped",
                 context=f"module: {module_name}, qualname: {qualname}, skip reason: {reason}",
