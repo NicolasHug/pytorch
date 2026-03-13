@@ -7898,7 +7898,12 @@ def meta_upsample_bimode2d_aa(
     )
 
 
-@register_meta([aten._upsample_bilinear2d_aa_backward.default])
+@register_meta(
+    [
+        aten._upsample_bilinear2d_aa_backward.default,
+        aten._upsample_lanczos2d_aa_backward.default,
+    ]
+)
 def meta_upsample_bimode2d_aa_backward(
     grad_output,
     output_size,

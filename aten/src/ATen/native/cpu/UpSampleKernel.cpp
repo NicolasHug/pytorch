@@ -2183,6 +2183,19 @@ void upsample_bicubic2d_aa_backward_kernel_impl(
       });
 }
 
+void upsample_lanczos2d_aa_backward_kernel_impl(
+    const Tensor& grad_input,
+    const Tensor& grad_output,
+    bool align_corners,
+    std::optional<double> scales_h,
+    std::optional<double> scales_w) {
+  AT_DISPATCH_FLOATING_TYPES(
+      grad_output.scalar_type(), "upsample_lanczos2d_aa_backward_cpu", [&] {
+        upsample_separable_Nd_backward_aa<scalar_t, scale_t, HelperInterpLanczos>(
+            grad_input, grad_output, align_corners, {scales_h, scales_w});
+      });
+}
+
 } // anonymous namespace
 
 REGISTER_DISPATCH(upsample_nearest1d_kernel, &upsample_nearest1d_kernel_impl)
@@ -2203,4 +2216,5 @@ REGISTER_DISPATCH(_upsample_bicubic2d_aa_kernel, &upsample_bicubic2d_aa_kernel_i
 REGISTER_DISPATCH(_upsample_bicubic2d_aa_backward_kernel, &upsample_bicubic2d_aa_backward_kernel_impl)
 
 REGISTER_DISPATCH(_upsample_lanczos2d_aa_kernel, &upsample_lanczos2d_aa_kernel_impl)
+REGISTER_DISPATCH(_upsample_lanczos2d_aa_backward_kernel, &upsample_lanczos2d_aa_backward_kernel_impl)
 } // namespace at::native
