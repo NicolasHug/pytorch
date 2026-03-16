@@ -297,8 +297,6 @@ void upsample_neon_bilinear_bicubic_uint8(const at::Tensor& input_,
 
   TORCH_INTERNAL_ASSERT(num_channels == 3);
 
-  // The NEON kernel operates on channels-last data, so convert if needed.
-  // (.contiguous() is a no-op if already in the right format.)
   auto input = input_.contiguous(at::MemoryFormat::ChannelsLast);
   bool output_is_not_cl = !output.is_contiguous(at::MemoryFormat::ChannelsLast);
 
