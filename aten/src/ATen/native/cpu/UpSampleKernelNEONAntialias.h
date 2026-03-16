@@ -279,7 +279,7 @@ void NeonResampleVertical(const at::Tensor& unpacked_output,
 // processes pixels as 4-byte RGBA units).
 template <typename scale_type, class F>
 void upsample_neon_bilinear_bicubic_uint8(const at::Tensor& input_,
-                                          const at::Tensor& output_,
+                                          const at::Tensor& output,
                                           bool align_corners,
                                           const scale_type& scales,
                                           bool antialias) {
@@ -287,11 +287,11 @@ void upsample_neon_bilinear_bicubic_uint8(const at::Tensor& input_,
   auto num_channels = input_.size(1);
   auto xin = input_.size(3);
   auto yin = input_.size(2);
-  auto xout = output_.size(3);
-  auto yout = output_.size(2);
+  auto xout = output.size(3);
+  auto yout = output.size(2);
 
   if (xin == xout && yin == yout) {
-    output_.copy_(input_);
+    output.copy_(input_);
     return;
   }
 
@@ -301,7 +301,7 @@ void upsample_neon_bilinear_bicubic_uint8(const at::Tensor& input_,
   // Input and output may independently be CF or CL, so we handle them
   // separately (same approach as the AVX path's skip_unpacking/skip_packing).
   bool skip_unpacking = input_.is_contiguous(at::MemoryFormat::ChannelsLast);
-  bool skip_packing = output_.is_contiguous(at::MemoryFormat::ChannelsLast);
+  bool skip_packing = output.is_contiguous(at::MemoryFormat::ChannelsLast);
 
   auto input = skip_unpacking ? input_ : input_.contiguous(at::MemoryFormat::ChannelsLast);
 
@@ -347,36 +347,33 @@ void upsample_neon_bilinear_bicubic_uint8(const at::Tensor& input_,
 
   // When the output isn't channels-last, the NEON kernel can't write to it
   // directly. We allocate a single-slice CL buffer for the final pass,
-  // reused across batches. The CL strides allow output_[i].copy_() to
+  // reused across batches. The CL strides allow output[i].copy_() to
   // correctly rearrange the interleaved data into the output's memory format.
-  at::Tensor buffer_output;
+  at::Tensor buffer_vert;
   if (!skip_packing) {
     auto out_h = need_vertical ? yout : yin;
-    buffer_output = at::empty({1, num_channels, out_h, xout},
+    buffer_vert = at::empty({1, num_channels, out_h, xout},
         input.options().memory_format(at::MemoryFormat::ChannelsLast))[0];
   }
 
   for (const auto i : c10::irange(batch_size)) {
-    at::Tensor input_slice = input[i];
-    at::Tensor final_output;
+    at::Tensor unpacked_input = input[i];
+    at::Tensor unpacked_output;
 
     if (need_horizontal) {
-      at::Tensor horiz_output;
-      if (need_vertical) {
-        horiz_output = buffer_horiz;
-      } else {
-        horiz_output = skip_packing ? output_[i] : buffer_output;
-      }
-      NeonResampleHorizontal(horiz_output, input_slice, ksize_horiz, horiz_indices_weights, horiz_weights_precision);
-      final_output = input_slice = horiz_output;
+      at::Tensor unpacked_output_temp = need_vertical
+          ? buffer_horiz
+          : (skip_packing ? output[i] : buffer_vert);
+      NeonResampleHorizontal(unpacked_output_temp, unpacked_input, ksize_horiz, horiz_indices_weights, horiz_weights_precision);
+      unpacked_output = unpacked_input = unpacked_output_temp;
     }
     if (need_vertical) {
-      final_output = skip_packing ? output_[i] : buffer_output;
-      NeonResampleVertical(final_output, input_slice, ksize_vert, vert_indices_weights, vert_weights_precision);
+      unpacked_output = skip_packing ? output[i] : buffer_vert;
+      NeonResampleVertical(unpacked_output, unpacked_input, ksize_vert, vert_indices_weights, vert_weights_precision);
     }
 
     if (!skip_packing) {
-      output_[i].copy_(final_output);
+      output[i].copy_(unpacked_output);
     }
   }
 }
