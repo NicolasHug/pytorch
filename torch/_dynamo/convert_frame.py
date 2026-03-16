@@ -36,7 +36,7 @@ import itertools
 import logging
 import os
 import pstats
-import random
+import random  # noqa: F401 -- eval_frame_cpp.cpp imports random at runtime; torch.package needs this to detect the dependency
 import subprocess
 import sys
 import tempfile
@@ -79,6 +79,7 @@ from torch.utils._python_dispatch import (
     _disable_current_modes,
     any_torch_dispatch_mode_on_stack,
     is_in_any_mode_without_ignore_compile_internals,
+    is_traceable_wrapper_subclass,
 )
 from torch.utils._traceback import CapturedTraceback, format_traceback_short
 
@@ -293,9 +294,11 @@ def preserve_global_state(fn: Callable[_P, _T]) -> Callable[_P, _T]:
     """
     Context manager to:
         1) Save/restore torch.is_grad_enabled() state
-        2) Save/restore python random state
-        3) Save/restore torch random state
-        4) Monkey patch torch.fx.graph_module._forward_from_src
+        2) Save/restore torch random state
+        3) Monkey patch torch.fx.graph_module._forward_from_src
+
+    NOTE: Python random state is preserved in eval_frame_cpp.cpp instead,
+    so that it wraps more of the compilation pipeline.
     """
 
     @functools.wraps(fn)
@@ -318,7 +321,6 @@ def preserve_global_state(fn: Callable[_P, _T]) -> Callable[_P, _T]:
             prior_mobile_allocator_state = (
                 torch._C._is_default_mobile_cpu_allocator_set()
             )
-            py_rng_state = random.getstate()
             prior_dtype = torch.get_default_dtype()
             torch_rng_state = torch.random.get_rng_state()
             cuda_rng_state = None
@@ -346,7 +348,6 @@ def preserve_global_state(fn: Callable[_P, _T]) -> Callable[_P, _T]:
                 torch.use_deterministic_algorithms(
                     prior_deterministic, warn_only=prior_warn_only
                 )
-                random.setstate(py_rng_state)
                 torch.random.set_rng_state(torch_rng_state)
                 torch.set_default_dtype(prior_dtype)
                 curr_mobile_allocator_state = (
@@ -1867,6 +1868,30 @@ def _compile(
         torch._dynamo.utils.ReinplaceCounters.clear()
         guarded_code = None
         tracer_output = None
+
+        if (
+            config.debug_backend_override
+            or config.debug_dynamo_config_override
+            or config.debug_inductor_config_override
+        ):
+            # Eagerly validate config override strings before entering the
+            # compilation try/except so that typos surface as clean ValueErrors
+            # instead of being wrapped as InternalTorchDynamoError.
+            from .graph_id_filter import (
+                _validate_backend_names,
+                _validate_dynamo_config_keys,
+                _validate_inductor_config_keys,
+            )
+
+            if err := _validate_backend_names(config.debug_backend_override):
+                raise ValueError(err)
+            if err := _validate_dynamo_config_keys(config.debug_dynamo_config_override):
+                raise ValueError(err)
+            if err := _validate_inductor_config_keys(
+                config.debug_inductor_config_override
+            ):
+                raise ValueError(err)
+
         try:
             guarded_code, tracer_output = compile_inner(code, one_graph, hooks)
 
@@ -2331,6 +2356,21 @@ class CatchErrorsWrapper:
         ):
             # nametuple constructor/_make
             return ConvertFrameReturn()
+
+        if (
+            frame.f_code.co_name == "__init__"
+            and frame.f_code.co_argcount > 0
+            and frame.f_code.co_varnames
+            and is_traceable_wrapper_subclass(
+                frame.f_locals.get(frame.f_code.co_varnames[0])
+            )
+        ):
+            # Skip tracing __init__ of traceable wrapper subclasses: self is
+            # partially initialized at this point (attributes set by __init__
+            # don't exist yet), so faking it would call __tensor_flatten__ and
+            # crash. Run eagerly instead, matching @torch._disable_dynamo behavior.
+            return ConvertFrameReturn()
+
         if torch._dynamo.utils.get_optimize_ddp_mode() == "ddp_optimizer":
             ddp_module = DistributedDataParallel._get_active_ddp_module()
             if ddp_module:

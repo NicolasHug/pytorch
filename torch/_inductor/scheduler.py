@@ -1916,28 +1916,7 @@ class FusedSchedulerNode(BaseSchedulerNode):
         assert node1.scheduler is node2.scheduler
         assert isinstance(node1, (SchedulerNode, FusedSchedulerNode))
         if node1.is_template() and isinstance(node2, ExternKernelSchedulerNode):
-            # Fuse multi outputs template and its outputs
-            #   * Node1 has memorydep of MultiOutput in reads
-            #   * Node2 has StarDep of MultiOutput in writes
-            # Rewrite the Node2' StarDep to MemoryDep, because calculate score_fusion_memory
-            # of the template node and its epilogue requires the same type of dependencies
-            assert isinstance(node2.node, MultiOutput)
-            assert len(node2.read_writes.writes) == 1
-            assert isinstance(next(iter(node2.read_writes.writes)), StarDep)
-            name = next(iter(node2.read_writes.writes)).name
-            template_nodes = [node for node in node1.get_nodes() if node.is_template()]
-            assert len(template_nodes) == 1
-            template_node = template_nodes[0]
-            assert len(template_node.read_writes.writes) == 1
-            write = next(iter(template_node.read_writes.writes))
-            assert isinstance(write, MemoryDep)
-            node2.read_writes.writes = OrderedSet(
-                [
-                    MemoryDep(
-                        name, write.index, write.var_names, write.size, write.mode
-                    ),
-                ]
-            )
+            assert isinstance(node2.node, ir.MultiOutput)
         else:
             assert isinstance(node2, (SchedulerNode, FusedSchedulerNode))
         nodes = list(itertools.chain(node1.get_nodes(), node2.get_nodes()))
@@ -4304,27 +4283,17 @@ class Scheduler:
             if fusion_log.isEnabledFor(logging.DEBUG):
                 if ms_fused < ms1 + ms2:
                     fusion_log.debug(
-                        "can fuse (benchmark): fusing %s with %s cause %sx speedup "
-                        "(ms_fused=%.6f, ms1=%.6f, ms2=%.6f, ms1+ms2=%.6f)",
+                        "can fuse (benchmark): fusing %s with %s cause %sx speedup",
                         node1.get_buffer_names(),
                         node2.get_buffer_names(),
                         green_text(f"{(ms1 + ms2) / ms_fused:.3f}"),
-                        ms_fused,
-                        ms1,
-                        ms2,
-                        ms1 + ms2,
                     )
                 else:
                     fusion_log.debug(
-                        "cannot fuse (benchmark): fusing %s with %s cause %sx slowdown "
-                        "(ms_fused=%.6f, ms1=%.6f, ms2=%.6f, ms1+ms2=%.6f)",
+                        "cannot fuse (benchmark): fusing %s with %s cause %sx slowdown",
                         node1.get_buffer_names(),
                         node2.get_buffer_names(),
                         red_text(f"{ms_fused / (ms1 + ms2):.3f}"),
-                        ms_fused,
-                        ms1,
-                        ms2,
-                        ms1 + ms2,
                     )
 
         if is_multi_template and any(
@@ -4393,19 +4362,6 @@ class Scheduler:
             num_triton_callers = sum(
                 isinstance(c, TritonTemplateCallerBase) for c in multi_node.choices
             )
-
-            # Check for fb-specific template fusion override
-            force_fb_fusion = False
-            if config.is_fbcode():
-                try:
-                    from torch._inductor.fb.tlx_templates.fusion import (
-                        should_force_fusion,
-                    )
-
-                    force_fb_fusion = should_force_fusion(multi_node)
-                except ImportError:
-                    pass
-
             # Track if the choice timings can be retrieved async after compilation
             get_choice_timings_async = (
                 use_pipelined_autotuning()
@@ -4442,6 +4398,8 @@ class Scheduler:
                 ms2_fused = _estimate_fused_epilogue_runtime(node1, node2, ms2)
 
             # Start compiling choices in parallel
+            from torch._inductor.codegen.simd import CantSplit
+
             future_choices: list[tuple[Any, LambdaFuture | None, ModuleType]] = []
             triton_choices = 0
             for choice, unfused_time in choice_timings_iter:
@@ -4468,17 +4426,16 @@ class Scheduler:
                     break
 
                 with multi_node.swap_as_triton_caller(choice):
-                    future_choices.append(
-                        (choice, *self.compile_kernel(node_list_fused))
-                    )
+                    try:
+                        future_choices.append(
+                            (choice, *self.compile_kernel(node_list_fused))
+                        )
+                    except CantSplit:
+                        # Epilogue node ranges may be incompatible with the
+                        # template kernel's tiling groups — skip this choice.
+                        continue
 
             if len(future_choices) == 0:
-                # Check if fb-specific fusion was requested but no choices available
-                if force_fb_fusion:
-                    fusion_log.warning(
-                        "FB template fusion requested but no choices available for benchmarking. "
-                        "Proceeding without fusion. Check if template compilation succeeded."
-                    )
                 return FusionResult.fuse(False)
 
             def benchmark_when_ready() -> bool:
@@ -4569,19 +4526,8 @@ class Scheduler:
                 if bench_epilogue:
                     log_fusion(min_ms_fused, ms1, ms2)
 
-                # Log if fb-specific template fusion is being forced
-                if force_fb_fusion:
-                    try:
-                        from torch._inductor.fb.tlx_templates.fusion import (
-                            log_fusion_forced,
-                        )
-
-                        log_fusion_forced(min_ms_fused, ms1, ms2)
-                    except ImportError:
-                        pass
-
                 if (
-                    not bench_epilogue or min_ms_fused < (ms1 + ms2) or force_fb_fusion
+                    not bench_epilogue or min_ms_fused < (ms1 + ms2)
                 ) and ms_fused_choice is not None:
                     if config.multi_kernel_hints:
                         hint_override_best_fusion_choice[None] = ms_fused_choice
@@ -4671,20 +4617,6 @@ class Scheduler:
                                 "slow_down_ratio": ms_fused / (ms1 + ms2),
                             }
                         )
-
-                    # Check if fb-specific template fusion should be forced regardless of benchmark
-                    if config.is_fbcode():
-                        try:
-                            from torch._inductor.fb.tlx_templates.fusion import (
-                                log_fusion_forced,
-                                should_force_fusion_for_node,
-                            )
-
-                            if should_force_fusion_for_node(node1):
-                                log_fusion_forced(ms_fused, ms1, ms2)
-                                return True
-                        except ImportError:
-                            pass
 
                     return ms_fused < ms1 + ms2
 
@@ -6225,12 +6157,19 @@ class Scheduler:
             score = MixOrderReduction.get_fusion_score(node1, node2)
             return _construct_return_value(score, 0, True)
 
-        # for evaluating fusion memory scores of UserDefinedTritonKernel,
-        # we use a slightly different logic which allows matching StarDep with MemoryDep in certain scenarios.
-        # (See the checks we make in `can_fuse_epilogue()` that makes this possible)
+        # For UserDefinedTritonKernel, the write deps are StarDep that won't
+        # match the epilogue's MemoryDep via set intersection.  For templates,
+        # a view/reshape between the template output and epilogue can produce
+        # different index expressions that don't match via set intersection.
+        # Fall back to name-based matching so that the fusion score reflects
+        # the actual shared buffers.
         if (
-            isinstance(node1.node, ir.UserDefinedTritonKernel)
-            and node1.node.can_fuse_epilogue()
+            (
+                isinstance(node1.node, ir.UserDefinedTritonKernel)
+                and node1.node.can_fuse_epilogue()
+            )
+            or node1.is_template()
+            or node2.is_template()
         ):
             node1_deps = node1.read_writes.reads | node1.read_writes.writes
             node2_deps = node2.read_writes.reads | node2.read_writes.writes
@@ -6238,8 +6177,8 @@ class Scheduler:
             def _match(dep1: Dep, dep2: Dep):
                 if dep1 == dep2:
                     return True
-                if (isinstance(dep1, StarDep) and isinstance(dep2, MemoryDep)) or (
-                    isinstance(dep1, StarDep) and isinstance(dep2, MemoryDep)
+                if isinstance(dep1, (StarDep, MemoryDep)) and isinstance(
+                    dep2, (StarDep, MemoryDep)
                 ):
                     return dep1.name == dep2.name
                 return False
@@ -7812,16 +7751,12 @@ class BaseScheduling:  # noqa: docstring_linter
         and node2 corresponds to one of its outputs. If so, we further check if
         backend supports this fusion.
 
-        Delegates to ``TemplateBuffer.can_fuse_multi_output_epilogue`` which
-        TemplateBuffer subclasses may override to allow fusion of additional node types.
         """
         template_buf = node1.get_template_node()
         if not isinstance(template_buf, ir.TemplateBuffer):
             return False
         if not template_buf.is_multi_outputs_template():
             return False
-        if template_buf.can_fuse_multi_output_epilogue(node2):
-            return True
         return False
 
     def fuse(
