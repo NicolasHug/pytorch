@@ -297,9 +297,12 @@ void upsample_neon_bilinear_bicubic_uint8(const at::Tensor& input_,
 
   TORCH_INTERNAL_ASSERT(num_channels == 3);
 
-  // The NEON kernel operates on interleaved (channels-last) data.
-  // Input and output may independently be CF or CL, so we handle them
-  // separately (same approach as the AVX path's skip_unpacking/skip_packing).
+  // The NEON kernel operates on channels-last data.
+  // Input and output may independently be CF or CL, so they may need to be
+  // converted.
+  // Note: we use the term "unpacking" and "packing" to keep names and logic
+  // consistent with UpSampleKernelAVXAntialias.h, but here, "unpacking" just
+  // means converting a tensor to CL, and packing means converting it to CF.
   bool skip_unpacking = input_.is_contiguous(at::MemoryFormat::ChannelsLast);
   bool skip_packing = output.is_contiguous(at::MemoryFormat::ChannelsLast);
 
