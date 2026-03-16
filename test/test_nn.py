@@ -10871,6 +10871,10 @@ class TestNNDeviceType(NNTestCase):
         with self.assertRaisesRegex(ValueError, "antialias=True"):
             F.interpolate(x_4d, size=(4, 4), mode="lanczos", antialias=False)
 
+        # align_corners=True not supported
+        with self.assertRaisesRegex(ValueError, "align_corners=True"):
+            F.interpolate(x_4d, size=(4, 4), mode="lanczos", align_corners=True, antialias=True)
+
     def test_upsamplingLanczos2d_identity(self, device):
         x = torch.randn(1, 3, 8, 8, device=device)
         out = F.interpolate(x, size=(8, 8), mode="lanczos", align_corners=False, antialias=True)

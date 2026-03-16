@@ -4933,6 +4933,8 @@ def interpolate(  # noqa: F811
     if input.dim() == 4 and mode == "lanczos":
         if align_corners is None:
             raise AssertionError("align_corners is unexpectedly None")
+        if align_corners:
+            raise ValueError("Lanczos mode does not support align_corners=True")
         if not antialias:
             raise ValueError("Lanczos mode requires antialias=True")
         return torch._C._nn._upsample_lanczos2d_aa(

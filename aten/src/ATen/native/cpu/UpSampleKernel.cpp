@@ -1427,7 +1427,7 @@ struct HelperInterpLanczos : public HelperInterpBase {
     if (x == 0.0) {
       return 1.0;
     }
-    x = x * c10::pi<scalar_t>;
+    x *= c10::pi<scalar_t>;
     return std::sin(x) / x;
   }
 
@@ -1613,7 +1613,7 @@ void upsample_separable_1d(
   unsigned int weights_precision = 0;
 
   if (input_scalar_type == at::kByte) {
-    // This is a special branch to provide uint8 dtype support for bilinear and bicubic modes only
+    // This is a special branch to provide uint8 dtype support for bilinear, bicubic and lanczos modes only
     TORCH_INTERNAL_ASSERT(F::interp_size == 2 || F::interp_size == 4 || F::interp_size == 6);
     int unused = 0;
     std::tie(indices_weights, unused, weights_precision) =
