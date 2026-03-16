@@ -300,7 +300,7 @@ void upsample_neon_bilinear_bicubic_uint8(const at::Tensor& input_,
   // The NEON kernel operates on channels-last data, so convert if needed.
   // (.contiguous() is a no-op if already in the right format.)
   auto input = input_.contiguous(at::MemoryFormat::ChannelsLast);
-  bool convert_output_to_cf = !output.is_contiguous(at::MemoryFormat::ChannelsLast);
+  bool output_is_not_cl = !output.is_contiguous(at::MemoryFormat::ChannelsLast);
 
   auto need_horizontal = xout != xin;
   auto need_vertical = yout != yin;
@@ -346,13 +346,13 @@ void upsample_neon_bilinear_bicubic_uint8(const at::Tensor& input_,
   // Otherwise we need a CL buffer so that output[i].copy_() correctly
   // converts interleaved data back into CF.
   at::Tensor cl_output;
-  if (convert_output_to_cf) {
+  if (output_is_not_cl) {
     cl_output = at::empty({1, num_channels, yout, xout},
         input.options().memory_format(at::MemoryFormat::ChannelsLast))[0];
   }
 
   for (const auto i : c10::irange(batch_size)) {
-    if (!convert_output_to_cf) {
+    if (!output_is_not_cl) {
       cl_output = output[i];
     }
     at::Tensor input_slice = input[i];
@@ -368,7 +368,7 @@ void upsample_neon_bilinear_bicubic_uint8(const at::Tensor& input_,
       NeonResampleVertical(cl_output, input_slice, ksize_vert, vert_indices_weights, vert_weights_precision);
     }
 
-    if (convert_output_to_cf) {
+    if (output_is_not_cl) {
       output[i].copy_(cl_output);
     }
   }
