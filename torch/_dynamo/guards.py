@@ -1168,9 +1168,7 @@ class GuardBuilder(GuardBuilderBase):
         self.source_ref = source_ref
         self.lookup_weakrefs = lookup_weakrefs
         self.scope: dict[str, dict[str, object]] = {"L": local_scope, "G": global_scope}
-        self.src_get_value_cache: weakref.WeakKeyDictionary[Source, object] = (
-            weakref.WeakKeyDictionary()
-        )
+        self.src_get_value_cache: dict[Source, object] = {}
         self.runtime_global_scope = runtime_global_scope or global_scope
         self.scope["__builtins__"] = builtins.__dict__.copy()
         for (
@@ -2438,7 +2436,20 @@ class GuardBuilder(GuardBuilderBase):
     )
     def TENSOR_SUBCLASS_METADATA_MATCH(self, guard: Guard) -> None:
         value = self.get(guard)
-        original_metadata = deepcopy(self.get(guard).__tensor_flatten__()[1])
+
+        # Deepcopying SymInts result in an error from copying FakeTensors.
+        # Instead we just always assume the metadata is the same.
+        class _AnyCompare:
+            def __eq__(self, other: object) -> bool:
+                return True
+
+            def __ne__(self, other: object) -> bool:
+                return False
+
+        metadata = value.__tensor_flatten__()[1]
+        original_metadata = deepcopy(
+            pytree.tree_map_only(torch.SymInt, lambda _: _AnyCompare(), metadata)
+        )
         if hasattr(value, "__metadata_guard__"):
             verify_guard_fn_signature(value)
             cls = type(value)

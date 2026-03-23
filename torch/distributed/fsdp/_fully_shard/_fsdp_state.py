@@ -212,7 +212,7 @@ class FSDPState(_State):
         for state in self._state_ctx.all_states:
             for fsdp_param_group in state._fsdp_param_groups:
                 for fsdp_param in fsdp_param_group.fsdp_params:
-                    if fsdp_param._orig_param_id in seen:
+                    if fsdp_param._orig_param_uid in seen:
                         raise ValueError(
                             f"Parameter '{fsdp_param._param_fqn}' is shared with a "
                             f"parameter already managed by another FSDP group. "
@@ -220,7 +220,7 @@ class FSDPState(_State):
                             f"fully_shard([module_a, module_b]) to place them in "
                             f"the same FSDP group."
                         )
-                    seen.add(fsdp_param._orig_param_id)
+                    seen.add(fsdp_param._orig_param_uid)
 
     def _init_shared_state(self) -> None:
         self._comm_ctx.lazy_init(self._device)

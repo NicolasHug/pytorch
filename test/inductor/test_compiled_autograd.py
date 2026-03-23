@@ -3312,7 +3312,6 @@ TORCH_LIBRARY(test_cudagraphs_cpu_scalar_used_in_cpp_custom_op, m) {
     @mock.patch(
         "torch._functorch.aot_autograd.AOT_COUNTER", new_callable=itertools.count
     )
-    @mock.patch("torch._dynamo.config.inline_inbuilt_nn_modules", True)
     def test_verbose_logs_aot_id(self, _):
         def fn():
             model = torch.nn.Sequential(
@@ -5413,6 +5412,9 @@ skipped_tests.add("test_clear_saved_tensors_on_access")
 skipped_tests.add("test_clear_saved_tensors_on_access_double_access_error")
 skipped_tests.add("test_forward_traceback_preserves_exception_with_checkpoint")
 skipped_tests.add("test_checkpoint_error_suggests_mark_dynamic")
+skipped_tests.add("test_checkpoint_automatic_dynamic_graph_shadowing")
+skipped_tests.add("test_checkpoint_automatic_dynamic_mark_dynamic_workaround")
+skipped_tests.add("test_checkpoint_automatic_dynamic_lru_disabled_workaround")
 
 test_autograd = load_test_module("test_autograd")
 test_custom_ops = load_test_module("test_custom_ops")

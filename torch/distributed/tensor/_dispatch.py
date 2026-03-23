@@ -7,7 +7,6 @@ from typing import cast
 
 import torch
 import torch.distributed as dist
-import torch.distributed.config as dist_config
 import torch.distributed.tensor._api as dtensor
 import torch.distributed.tensor._random as random
 from torch._library.utils import fill_defaults
@@ -89,6 +88,15 @@ def is_same_size_handler(
     return lhs.shape == rhs.shape
 
 
+def is_pinned_handler(
+    op_call: torch._ops.OpOverload,
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+) -> bool:
+    tensor = cast(dtensor.DTensor, args[0])
+    return tensor._local_tensor.is_pinned()
+
+
 def found_inf_reduce_handler(
     op_call: torch._ops.OpOverload,
     args: tuple[object, ...],
@@ -167,6 +175,7 @@ class OpDispatcher:
         }
         self._custom_op_handlers = {
             aten.is_same_size.default: is_same_size_handler,
+            aten.is_pinned.default: is_pinned_handler,
             aten.convolution.default: convolution_handler,
             aten.convolution_backward.default: convolution_backward_handler,
             aten._amp_foreach_non_finite_check_and_unscale_.default: found_inf_reduce_handler,
@@ -362,10 +371,6 @@ class OpDispatcher:
                             )
                     else:
                         # CUDA device without user generator, use HOP for traceability
-                        if dist_config.compile_on_one_rank:
-                            raise NotImplementedError(
-                                "run_dtensor_rng_op is not yet compatible with compile_on_one_rank"
-                            )
                         if not isinstance(
                             random._rng_tracker, random.OffsetBasedRNGTracker
                         ):
