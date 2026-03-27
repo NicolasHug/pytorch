@@ -46,6 +46,7 @@ from torch.testing._internal.common_utils import (
     scoped_load_inline,
     skipIfWindows,
     skipIfXpu,
+    TEST_WITH_ROCM,
 )
 from torch.testing._internal.hop_db import hop_db
 from torch.testing._internal.inductor_utils import (
@@ -53,7 +54,7 @@ from torch.testing._internal.inductor_utils import (
     HAS_CPU,
     HAS_CUDA_AND_TRITON,
     HAS_GPU,
-    HAS_XPU_AND_TRITON,
+    HAS_GPU_AND_TRITON,
 )
 from torch.testing._internal.logging_utils import logs_to_string
 from torch.testing._internal.triton_utils import (
@@ -3312,7 +3313,6 @@ TORCH_LIBRARY(test_cudagraphs_cpu_scalar_used_in_cpp_custom_op, m) {
     @mock.patch(
         "torch._functorch.aot_autograd.AOT_COUNTER", new_callable=itertools.count
     )
-    @mock.patch("torch._dynamo.config.inline_inbuilt_nn_modules", True)
     def test_verbose_logs_aot_id(self, _):
         def fn():
             model = torch.nn.Sequential(
@@ -5417,16 +5417,19 @@ skipped_tests.add("test_checkpoint_automatic_dynamic_graph_shadowing")
 skipped_tests.add("test_checkpoint_automatic_dynamic_mark_dynamic_workaround")
 skipped_tests.add("test_checkpoint_automatic_dynamic_lru_disabled_workaround")
 
+# Fails with triton 3.7
+if TEST_WITH_ROCM:
+    skipped_tests.add("test_concat_unbacked_shape_tensor")
+
 test_autograd = load_test_module("test_autograd")
 test_custom_ops = load_test_module("test_custom_ops")
 test_higher_order_ops = load_test_module("dynamo/test_higher_order_ops")
-if not HAS_XPU_AND_TRITON:
-    TestAutogradWithCompiledAutograd = wrap_test_class(test_autograd.TestAutograd)
+
+TestAutogradWithCompiledAutograd = wrap_test_class(test_autograd.TestAutograd)
 TestNestedCheckpointWithCompiledAutograd = wrap_test_class(
     test_autograd.TestNestedCheckpoint
 )
-if not HAS_XPU_AND_TRITON:
-    TestCustomOpWithCompiledAutograd = wrap_test_class(test_custom_ops.TestCustomOp)
+TestCustomOpWithCompiledAutograd = wrap_test_class(test_custom_ops.TestCustomOp)
 HigherOrderOpTestsWithCompiledAutograd = wrap_test_class(
     test_higher_order_ops.HigherOrderOpTests
 )
@@ -5437,7 +5440,7 @@ ActivationCheckpointingTestsWithCompiledAutograd = wrap_test_class(
     test_higher_order_ops.ActivationCheckpointingTests
 )
 
-if torch.distributed.is_available() and HAS_CUDA_AND_TRITON:
+if torch.distributed.is_available() and HAS_GPU_AND_TRITON:
     test_dtensor = load_test_module("distributed/tensor/test_dtensor_compile")
     TestDTensorCompileWithCompiledAutograd = wrap_test_class(
         test_dtensor.TestDTensorCompile

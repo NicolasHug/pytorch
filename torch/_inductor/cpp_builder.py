@@ -437,6 +437,56 @@ def convert_cubin_to_obj(
     return obj_file
 
 
+def batch_convert_cubins_to_obj(
+    cubins: list[tuple[str, str]],
+    output_dir: str,
+    cpp_compiler: str = "gcc",
+) -> str:
+    """Convert multiple cubin files to a single .o using batched .incbin assembly.
+
+    Instead of spawning 3 subprocesses per cubin (ld + 2x objcopy), generates
+    a single .S file with .incbin directives for all cubins and compiles it
+    with one compiler invocation. Produces bit-identical rodata and symbols
+    as the per-cubin convert_cubin_to_obj approach.
+
+    Args:
+        cubins: list of (cubin_file_path, kernel_name) tuples.
+        output_dir: directory for the generated .S and .o files.
+        cpp_compiler: C compiler to use for assembling (default: gcc).
+
+    Returns:
+        Path to the combined .o file.
+    """
+    asm_path = os.path.join(output_dir, "cubins_combined.S")
+    obj_path = os.path.join(output_dir, "cubins_combined.o")
+
+    with open(asm_path, "w") as f:
+        f.write(".section .rodata\n")
+        for cubin_file, kernel_name in cubins:
+            # Use absolute path to avoid issues with working directory
+            abs_cubin = os.path.abspath(cubin_file)
+            escaped_path = abs_cubin.replace("\\", "\\\\").replace('"', '\\"')
+            f.write(
+                f".balign 16\n"
+                f".global __{kernel_name}_start\n"
+                f".global __{kernel_name}_end\n"
+                f"__{kernel_name}_start:\n"
+                f'.incbin "{escaped_path}"\n'
+                f"__{kernel_name}_end:\n"
+                f".global __{kernel_name}_size\n"
+                f".set __{kernel_name}_size, "
+                f"__{kernel_name}_end - __{kernel_name}_start\n"
+            )
+
+    subprocess.run(
+        [cpp_compiler, "-c", asm_path, "-o", obj_path],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return obj_path
+
+
 @functools.cache
 def _is_apple_clang(cpp_compiler: str) -> bool:
     version_string = subprocess.check_output([cpp_compiler, "--version"]).decode("utf8")
@@ -2106,7 +2156,7 @@ class CppBuilder:
         self,
     ) -> None:
         with dynamo_timed("compile_file"):
-            command = self.get_command_line().split()
+            command = shlex.split(self.get_command_line())
             try:
                 output_path = self._target_file
                 # When we build remotely, we need to make sure to carefully copy any files
@@ -2177,7 +2227,7 @@ class CppBuilder:
             f"""
             cmake_minimum_required(VERSION 3.27 FATAL_ERROR)
             project({self._target_name} LANGUAGES CXX)
-            set(CMAKE_CXX_STANDARD 17)
+            set(CMAKE_CXX_STANDARD 20)
 
             # Set a library target
             add_library({self._target_name} {target_library_type})

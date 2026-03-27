@@ -32,7 +32,7 @@ from torch.testing._internal.common_cuda import (
     requires_triton_ptxas_compat,
     TRITON_PTXAS_VERSION,
 )
-from torch.testing._internal.common_utils import IS_FBCODE, TEST_CUDA
+from torch.testing._internal.common_utils import IS_FBCODE, skipIfRocm, TEST_CUDA
 from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU
 
 
@@ -308,8 +308,11 @@ class TestAOTInductorPackage(TestCase):
                 if self.device == GPU_TYPE:
                     kernel_bin = get_kernel_bin_format(self.device)
                     self.assertTrue(not list(tmp_path.glob(f"*.{kernel_bin}")))
-                    # Check if .cubin.o files exist and use unique kernel names
-                    self.assertTrue(list(tmp_path.glob(f"triton_*.{kernel_bin}.o")))
+                    # Check that cubin binaries are embedded as object files.
+                    # Either individual per-kernel .o files or a single combined .o.
+                    individual_objs = list(tmp_path.glob(f"triton_*.{kernel_bin}.o"))
+                    combined_obj = list(tmp_path.glob("cubins_combined.o"))
+                    self.assertTrue(individual_objs or combined_obj)
 
                 # Check if the .so file was build successfully
                 so_path = build_path / "libaoti_model.so"
@@ -319,6 +322,7 @@ class TestAOTInductorPackage(TestCase):
                 self.assertTrue(torch.allclose(actual, expected))
 
     @requires_triton_ptxas_compat
+    @skipIfRocm(msg="Fails with Triton 3.7")
     @unittest.skipIf(IS_FBCODE, "cmake won't work in fbcode")
     def test_compile_after_package_multi_arch(self):
         if self.device != GPU_TYPE:

@@ -55,6 +55,7 @@ from torch.testing._internal.common_utils import (
     run_tests,
     skipIfHpu,
     skipIfTorchDynamo,
+    skipIfXpu,
 )
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
@@ -260,7 +261,7 @@ class TestDTensorCompile(torch._dynamo.test_case.TestCase):
 
             def forward(self, x):
                 inter = self.buffer + DTensor.from_local(
-                    x, mesh, [Shard(0)], run_check=False
+                    x, self.buffer.device_mesh, [Shard(0)], run_check=False
                 )
                 return inter.to_local()
 
@@ -272,11 +273,11 @@ class TestDTensorCompile(torch._dynamo.test_case.TestCase):
         self.assertExpectedInline(
             str(backend.graphs[0].code).strip(),
             """\
-def forward(self, L_self_buffers_buffer_ : torch.distributed.tensor.DTensor, L_x_ : torch.Tensor, L_mesh_ : torch.distributed.device_mesh.DeviceMesh):
+def forward(self, L_self_buffers_buffer_ : torch.distributed.tensor.DTensor, L_x_ : torch.Tensor, L_self_buffers_buffer_device_mesh : torch.distributed.device_mesh.DeviceMesh):
     l_self_buffers_buffer_ = L_self_buffers_buffer_
     l_x_ = L_x_
-    l_mesh_ = L_mesh_
-    from_local = torch.distributed.tensor._api.from_local(l_x_, l_mesh_, [torch.distributed.tensor.placement_types.Shard(dim=0)], run_check = False);  l_x_ = l_mesh_ = None
+    l_self_buffers_buffer_device_mesh = L_self_buffers_buffer_device_mesh
+    from_local = torch.distributed.tensor._api.from_local(l_x_, l_self_buffers_buffer_device_mesh, [torch.distributed.tensor.placement_types.Shard(dim=0)], run_check = False);  l_x_ = l_self_buffers_buffer_device_mesh = None
     inter = l_self_buffers_buffer_ + from_local;  l_self_buffers_buffer_ = from_local = None
     to_local = inter.to_local();  inter = None
     return (to_local,)""",  # noqa: B950
@@ -292,6 +293,7 @@ def forward(self, arg0_1, arg1_1, arg2_1):
     return (view_1,)""",  # noqa: B950
         )
 
+    @skipIfXpu(msg="AssertionError: torch-xpu-ops: 2958")
     @unittest.skipIf(not torch.accelerator.is_available(), "accelerator not available")
     def test_dtensor_basic_export(self):
         mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
@@ -344,9 +346,9 @@ def forward(self, args_0):
         # add is performed in _propagate_tensor_meta_non_cached, hence add_1 instead of add
         self.assertExpectedInline(
             str(joint_gm.code).strip(),
-            """\
+            f"""\
 def forward(self, arg0_1, arg1_1):
-    _to_copy = torch.ops.aten._to_copy.default(arg1_1, dtype = torch.float64, layout = torch.strided, device = device(type='cuda', index=0));  arg1_1 = None
+    _to_copy = torch.ops.aten._to_copy.default(arg1_1, dtype = torch.float64, layout = torch.strided, device = device(type='{self.device_type}', index=0));  arg1_1 = None
     view = torch.ops.aten.view.default(_to_copy, [4, 4]);  _to_copy = None
     add = torch.ops.aten.add.Tensor(arg0_1, view);  arg0_1 = view = None
     view_1 = torch.ops.aten.view.default(add, [4, 4]);  add = None
@@ -836,6 +838,25 @@ def forward(self, arg0_1, arg1_1):
         f(x)
 
         self.assertEqual(cnt.frame_count, 2)
+
+    @with_comms
+    @torch._dynamo.config.patch(trace_autograd_ops=True)
+    def test_dtensor_requires_grad_intermediate_backward(self):
+        mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
+
+        def fn(x):
+            y = x * 2
+            y.requires_grad_()
+            loss = (y * 3).sum()
+            loss.backward()
+            return y.grad
+
+        full_x = torch.randn(8, 8)
+        x = distribute_tensor(full_x, mesh, [Shard(0)])
+
+        ref = fn(x.full_tensor())
+        result = torch.compile(fn, backend="aot_eager", fullgraph=True)(x)
+        self.assertEqual(ref, result.full_tensor())
 
     def test_dtensor_attribute_access_on_intermediate(self):
         mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
@@ -1781,6 +1802,75 @@ class outer_fn(torch.nn.Module):
         # Test backward pass
         result.sum().backward()
 
+    def test_to_local_symbolic_sizes_non_sharded_dims(self):
+        # Checks that symbolic sizes are not polluted by the sharding
+        # in to_local - for instance we could incorrectly have (16 * (s27//2))
+        # as opposed to just (8 * s27) which enables correct generation
+        # https://github.com/pytorch/pytorch/issues/175690
+        mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
+
+        def fn(x):
+            local = x.narrow(1, 0, x.shape[1] // self.world_size)
+            dt = DTensor.from_local(
+                local,
+                mesh,
+                [Shard(1)],
+                run_check=False,
+                shape=x.shape,
+                stride=x.stride(),
+            )
+            r = dt.redistribute(placements=[Replicate()])
+            out = r.to_local()
+            return out.view(out.shape[0], -1)
+
+        inp = torch.randn(1, 10, 8)
+        torch._dynamo.mark_dynamic(inp, 1)
+
+        backend = AotEagerAndRecordGraphs()
+        opt_fn = torch.compile(fn, backend=backend, fullgraph=True)
+        result = opt_fn(inp)
+        self.assertEqual(result, fn(inp))
+
+        # The view shape should use the clean symbol (s0), not 2*((s0//2)).
+        fw_code = backend.fw_graphs[0].print_readable(print_output=False)
+        for line in fw_code.splitlines():
+            if "view" in line and "-1" in line:
+                self.assertNotIn("//", line, f"Polluted symbolic shape: {line}")
+
+    def test_to_local_symbolic_sizes_uneven_shard(self):
+        # Regression test to ensure our narrow changes does not cause any
+        # unintentional incorrectness
+        mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
+
+        def fn(x):
+            local = x.narrow(1, 0, x.shape[1] // self.world_size)
+            dt = DTensor.from_local(
+                local,
+                mesh,
+                [Shard(1)],
+                run_check=False,
+                shape=x.shape,
+                stride=x.stride(),
+            )
+            r = dt.redistribute(placements=[Replicate()])
+            out = r.to_local()
+            return out.view(out.shape[0], -1)
+
+        opt_fn = torch.compile(fn, backend="aot_eager")
+
+        # Divisible: 10 % 2 == 0
+        inp_even = torch.randn(1, 10, 8)
+        torch._dynamo.mark_dynamic(inp_even, 1)
+        result = opt_fn(inp_even)
+        self.assertEqual(result, fn(inp_even))
+
+        # Non-divisible: 9 % 2 != 0, exercises padding/unpadding + recompile
+        # - most importantly ensures correctness
+        inp_odd = torch.randn(1, 9, 8)
+        torch._dynamo.mark_dynamic(inp_odd, 1)
+        result = opt_fn(inp_odd)
+        self.assertEqual(result, fn(inp_odd))
+
 
 @instantiate_parametrized_tests
 class TestDTensorCompileE2E(DTensorTestBase):
@@ -2047,7 +2137,7 @@ class TestDTensorCompileE2E(DTensorTestBase):
         # flattening on non-first dimension should fail
         dt = create_dt(1)
         with self.assertRaisesRegex(
-            RuntimeError, "cannot be performed without redistribution"
+            RuntimeError, "is not evenly divisible by mesh dimension"
         ):
             flatten_on_even_mesh(dt)
 
@@ -2058,7 +2148,7 @@ class TestDTensorCompileE2E(DTensorTestBase):
         # uneven case: not informing compiler of divisibility will crash
         dt = create_dt(0)
         with self.assertRaisesRegex(
-            RuntimeError, "Attempted to flatten unevenly sharded dimension 0"
+            RuntimeError, "is not evenly divisible by mesh dimension"
         ):
             flatten(dt)
 
@@ -2087,6 +2177,63 @@ class TestDTensorCompileE2E(DTensorTestBase):
             self.assertEqual(len(result), len(expected))
             for dt_chunk, tensor_chunk in zip(result, expected):
                 self.assertEqual(dt_chunk.full_tensor(), tensor_chunk)
+
+    @with_comms
+    def test_dtensor_processgroup_backward(self):
+        """Test that ProcessGroups are correctly handled in backward graph."""
+        from torch._functorch.aot_autograd import aot_function
+
+        with patch("torch.distributed.config.compile_on_one_rank", True):
+            mesh = self.build_device_mesh()
+
+            def fn(dt):
+                out = dt.redistribute(mesh, [Replicate()])
+                return out.sum()
+
+            local_tensor = torch.randn(
+                4, 8, device=self.device_type, requires_grad=True
+            )
+            dt_input = DTensor.from_local(
+                local_tensor, mesh, [Shard(0)], run_check=False
+            )
+
+            fw_graph_cell = [None]
+            bw_graph_cell = [None]
+
+            def extract_fw_graph(fx_g, _):
+                fw_graph_cell[0] = fx_g
+                return fx_g
+
+            def extract_bw_graph(fx_g, _):
+                bw_graph_cell[0] = fx_g
+                return fx_g
+
+            compiled_fn = aot_function(
+                fn,
+                fw_compiler=extract_fw_graph,
+                bw_compiler=extract_bw_graph,
+            )
+
+            output = compiled_fn(dt_input)
+            output.backward()
+
+            fw_graph = fw_graph_cell[0]
+            if fw_graph is not None:
+                fw_code = fw_graph.code
+                self.assertNotIn(
+                    "_opaque_obj",
+                    fw_code,
+                    f"Forward graph should not contain opaque objects. Graph:\n{fw_code}",
+                )
+
+            bw_graph = bw_graph_cell[0]
+            if bw_graph is not None:
+                bw_code = bw_graph.code
+                self.assertNotIn(
+                    "_opaque_obj",
+                    bw_code,
+                    f"Backward graph should not contain opaque objects. Graph:\n{bw_code}",
+                )
 
 
 if __name__ == "__main__":

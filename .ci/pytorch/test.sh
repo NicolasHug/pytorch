@@ -14,9 +14,10 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 # shellcheck source=./common-build.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common-build.sh"
 
-# Do not change workspace permissions for ROCm and s390x CI jobs
-# as it can leave workspace with bad permissions for cancelled jobs
-if [[ "$BUILD_ENVIRONMENT" != *rocm* && "$BUILD_ENVIRONMENT" != *s390x* && -d /var/lib/jenkins/workspace ]]; then
+# Only change workspace permissions if passwordless sudo is available
+# (e.g. ROCm and s390x CI jobs lack it, and changing permissions
+# can leave the workspace in a bad state for cancelled jobs)
+if sudo -n true 2>/dev/null && [[ -d /var/lib/jenkins/workspace ]]; then
   # Workaround for dind-rootless userid mapping (https://github.com/pytorch/ci-infra/issues/96)
   WORKSPACE_ORIGINAL_OWNER_ID=$(stat -c '%u' "/var/lib/jenkins/workspace")
   cleanup_workspace() {
@@ -360,6 +361,7 @@ test_python_smoke_b200() {
       inductor/test_torchinductor \
       inductor/test_nv_universal_gemm \
       inductor/test_fused_attention \
+      test_varlen_attention \
       $PYTHON_TEST_EXTRA_OPTION \
       --upload-artifacts-while-running
   assert_git_not_dirty
@@ -414,6 +416,7 @@ test_b200_symm_mem() {
 
 test_h100_cutlass_backend() {
   # cutlass backend tests for H100
+  git submodule update --init --depth 1 third_party/cutlass
   TORCHINDUCTOR_CUTLASS_DIR=$(realpath "./third_party/cutlass") python test/run_test.py --include inductor/test_cutlass_backend -k "not addmm" $PYTHON_TEST_EXTRA_OPTION --upload-artifacts-while-running
   TORCHINDUCTOR_CUTLASS_DIR=$(realpath "./third_party/cutlass") python test/run_test.py --include inductor/test_cutlass_evt $PYTHON_TEST_EXTRA_OPTION --upload-artifacts-while-running
 }
@@ -434,12 +437,16 @@ test_dynamo_core() {
 }
 
 test_dynamo_cpython() {
+  # Disable TD for cpython since it's pretty cheap to run the cpython tests (< 10 min)
+  # and if TD is enabled, only 25% of the tests will be executed
+  export NO_TD=1
   time python test/run_test.py \
     --include-cpython-tests \
     --dynamo \
     --verbose \
     --upload-artifacts-while-running
   assert_git_not_dirty
+  unset NO_TD
 }
 
 test_dynamo_wrapped_shard() {
@@ -613,7 +620,7 @@ test_inductor_cpp_wrapper_shard() {
     --shard "$1" "$NUM_TEST_SHARDS" \
     --verbose
   TORCHINDUCTOR_AUTOTUNE_AT_COMPILE_TIME=0 python test/run_test.py \
-    --include inductor/test_torchinductor inductor/test_triton_kernels\
+    --include inductor/test_torchinductor inductor/test_triton_kernels inductor/test_max_autotune \
     --shard "$1" "$NUM_TEST_SHARDS" \
     --verbose
   if [[ "${BUILD_ENVIRONMENT}" == *xpu* ]]; then
@@ -833,6 +840,11 @@ test_perf_for_dashboard() {
         TORCHINDUCTOR_MAX_AUTOTUNE=1 $TASKSET python "benchmarks/dynamo/$suite.py" \
             "${target_flag[@]}" --"$mode" --"$dtype" --backend "$backend" "$@" \
             --output "$TEST_REPORTS_DIR/${backend}_max_autotune_${suite}_${dtype}_${mode}_${device}_${target}.csv"
+      fi
+      if [[ "$DASHBOARD_TAG" == *deterministic_perf-true* ]]; then
+        $TASKSET python "benchmarks/dynamo/$suite.py" \
+            "${target_flag[@]}" --"$mode" --"$dtype" --backend "$backend" --disable-cudagraphs --deterministic "$@" \
+            --output "$TEST_REPORTS_DIR/${backend}_deterministic_perf_${suite}_${dtype}_${mode}_${device}_${target}.csv"
       fi
     done
   done
@@ -1798,6 +1810,8 @@ test_linux_aarch64() {
         test_foreach test_reductions test_unary_ufuncs test_tensor_creation_ops test_ops profiler/test_memory_profiler \
         distributed/elastic/timer/api_test distributed/elastic/timer/local_timer_example distributed/elastic/timer/local_timer_test \
         test_linalg \
+        test_jit test_jit_autocast test_ops_jit \
+        test_nn nn/test_convolution functorch/test_ops functorch/test_aotdispatch \
         --shard "$SHARD_NUMBER" "$NUM_TEST_SHARDS" --verbose
 
   # Dynamo tests
@@ -1817,6 +1831,7 @@ test_linux_aarch64() {
        inductor/test_torchinductor_codegen_dynamic_shapes inductor/test_torchinductor_dynamic_shapes inductor/test_memory \
        inductor/test_triton_cpu_backend inductor/test_triton_extension_backend inductor/test_mkldnn_pattern_matcher inductor/test_cpu_cpp_wrapper \
        inductor/test_cpu_select_algorithm inductor/test_cpu_repro \
+       inductor/test_aot_inductor inductor/test_fused_attention \
        --shard "$SHARD_NUMBER" "$NUM_TEST_SHARDS" --verbose
 }
 

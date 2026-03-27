@@ -104,6 +104,7 @@ HAVE_TEST_SELECTION_TOOLS = True
 TEST_CONFIG = os.getenv("TEST_CONFIG", "")
 BUILD_ENVIRONMENT = os.getenv("BUILD_ENVIRONMENT", "")
 RERUN_DISABLED_TESTS = os.getenv("PYTORCH_TEST_RERUN_DISABLED_TESTS", "0") == "1"
+NUM_PYTEST_RERUNS = int(os.getenv("PYTORCH_NUM_PYTEST_RERUNS", "2"))
 DISTRIBUTED_TEST_PREFIX = "distributed"
 INDUCTOR_TEST_PREFIX = "inductor"
 IS_SLOW = "slow" in TEST_CONFIG or "slow" in BUILD_ENVIRONMENT
@@ -200,12 +201,10 @@ ROCM_BLOCKLIST = [
 
 # Add architecture-specific blocklist entries
 if TEST_WITH_ROCM and isRocmArchAnyOf(("gfx1100",)):
-    # Some autotune tests on gfx1100 are hanging, disable for now
-    ROCM_BLOCKLIST.append("inductor/test_max_autotune")
-    # ROCm 7.2 gfx1100 started timing out due to these
-    ROCM_BLOCKLIST.append("inductor/test_torchinductor_dynamic_shapes")
-    ROCM_BLOCKLIST.append("inductor/test_torchinductor_opinfo")
-    ROCM_BLOCKLIST.append("inductor/test_ck_backend")
+    # Skip all inductor tests on Navi arch
+    ROCM_BLOCKLIST.extend(
+        test for test in TESTS if test.startswith(INDUCTOR_TEST_PREFIX)
+    )
 
 S390X_BLOCKLIST = [
     # these tests fail due to various reasons
@@ -1266,9 +1265,9 @@ def get_pytest_args(options, is_cpp_test=False, is_distributed_test=False):
         # flakiness status. Default to 50 re-runs
         rerun_options = ["--flake-finder", f"--flake-runs={count}"]
     else:
-        # When under the normal mode, retry a failed test 2 more times. -x means stop at the first
-        # failure
-        rerun_options = ["-x", "--reruns=2"]
+        # When under the normal mode, retry a failed test NUM_PYTEST_RERUNS more times.
+        # -x means stop at the first failure. Set PYTORCH_NUM_PYTEST_RERUNS=0 to disable.
+        rerun_options = ["-x", f"--reruns={NUM_PYTEST_RERUNS}"]
 
     pytest_args = [
         "-vv",

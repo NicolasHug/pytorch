@@ -96,7 +96,13 @@ from ..utils import (
     tuple_methods,
     unpatched_nn_module_getattr,
 )
-from .base import MutationType, raise_type_error_exc, ValueMutationNew, VariableTracker
+from .base import (
+    MutationType,
+    NO_SUCH_SUBOBJ,
+    raise_type_error_exc,
+    ValueMutationNew,
+    VariableTracker,
+)
 from .dicts import ConstDictVariable, DefaultDictVariable, SetVariable
 
 
@@ -152,6 +158,14 @@ def is_cython_function(obj: object) -> bool:
         callable(obj)
         and hasattr(type(obj), "__name__")
         and type(obj).__name__ == "cython_function_or_method"
+    )
+
+
+def is_pydantic_dataclass_cls(value: object) -> bool:
+    return (
+        inspect.isclass(value)
+        and dataclasses.is_dataclass(value)
+        and "__is_pydantic_dataclass__" in getattr(value, "__dict__", {})
     )
 
 
@@ -353,7 +367,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
                 return VariableTracker.build(tx, obj.__get__(self.value), source)
 
         if ConstantVariable.is_literal(obj):
-            return VariableTracker.build(tx, obj)
+            return VariableTracker.build(tx, obj, source)
         elif isinstance(obj, enum.Enum):
             return VariableTracker.build(tx, obj, source)
         elif self.value is collections.OrderedDict:
@@ -547,7 +561,6 @@ class UserDefinedClassVariable(UserDefinedVariable):
                         "Set TORCHDYNAMO_ENABLE_P2P_COMPILATION=1 to enable.",
                     ],
                 )
-
             var = tx.output.side_effects.track_new_user_defined_object(
                 SourcelessBuilder.create(tx, object),
                 self,
@@ -792,13 +805,13 @@ class UserDefinedClassVariable(UserDefinedVariable):
                     )
                 ] + args[1:]
 
-            cm_obj = tx.output.side_effects.track_new_user_defined_object(
-                SourcelessBuilder.create(tx, object),
-                self,
-                arg_new,  # type: ignore[arg-type]
+            return tx.inline_user_function_return(
+                VariableTracker.build(
+                    tx, polyfills.instantiate_user_defined_class_object
+                ),
+                [self, *arg_new],
+                kwargs,
             )
-            cm_obj.call_method(tx, "__init__", arg_new, kwargs)  # type: ignore[arg-type]
-            return cm_obj
         elif is_namedtuple_cls(self.value):
             fields = namedtuple_fields(self.value)  # type: ignore[arg-type]
             # check if this a quasi-namedtuple or a real one
@@ -851,6 +864,16 @@ class UserDefinedClassVariable(UserDefinedVariable):
 
             tup = SourcelessBuilder.create(tx, tuple).call_function(tx, args, kwargs)
             return SizeVariable(tup.items)  # type: ignore[missing-attribute]
+        elif is_pydantic_dataclass_cls(self.value):
+            # Pydantic populates dataclass fields through an external validator,
+            # so tracing through the constructor misses the instance mutations.
+            unimplemented(
+                gb_type="Pydantic dataclass constructor",
+                context=f"{self.value}",
+                explanation="Dynamo graph breaks on pydantic dataclass constructors "
+                "because validation mutates the instance outside traced bytecode.",
+                hints=graph_break_hints.SUPPORTABLE,
+            )
         elif is_frozen_dataclass(self.value) and self.is_standard_new():
             fields = dataclasses.fields(self.value)  # type: ignore[arg-type]
             assert self.source is not None
@@ -887,7 +910,6 @@ class UserDefinedClassVariable(UserDefinedVariable):
 
                     default_kwargs[field.name] = var_tracker
             kwargs.update(default_kwargs)
-
             var = tx.output.side_effects.track_new_user_defined_object(
                 SourcelessBuilder.create(tx, object),
                 self,
@@ -1029,8 +1051,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
                     functools.partial(GuardBuilder.HASATTR, attr=name)
                 )
             )
-            return VariableTracker.build(tx, hasattr(self.value, name))
-        return super().call_obj_hasattr(tx, name)
+        return VariableTracker.build(tx, hasattr(self.value, name))
 
     def const_getattr(self, tx: "InstructionTranslator", name: str) -> Any:
         if name == "__name__":
@@ -1049,11 +1070,34 @@ class UserDefinedClassVariable(UserDefinedVariable):
             and self.value is other.value
         )
 
+    def get_real_python_backed_value(self) -> object:
+        return self.value
+
 
 class UserDefinedExceptionClassVariable(UserDefinedClassVariable):
     @property
     def fn(self) -> type[object]:
         return self.value
+
+    def call_function(
+        self,
+        tx: "InstructionTranslator",
+        args: Sequence[VariableTracker],
+        kwargs: dict[str, VariableTracker],
+    ) -> VariableTracker:
+        from .builder import SourcelessBuilder
+
+        if self.source is None:
+            # NB: If source is added via side effects, create the exception
+            # object through side_effects as well. See FrozenDataClass creation
+            var = tx.output.side_effects.track_new_user_defined_object(
+                SourcelessBuilder.create(tx, BaseException),
+                self,
+                list(args),
+            )
+            var.call_method(tx, "__init__", list(args), dict(kwargs))
+            return var
+        return super().call_function(tx, args, kwargs)
 
 
 class UserDefinedEnumClassVariable(UserDefinedClassVariable):
@@ -1110,10 +1154,6 @@ class UserDefinedEnumClassVariable(UserDefinedClassVariable):
                 source = self.source and AttrSource(self.source, name)
                 return variables.UserMethodVariable(method, self, source=source)
         return super().var_getattr(tx, name)
-
-
-class NO_SUCH_SUBOBJ:
-    pass
 
 
 class RemovableHandleClass:
@@ -1235,6 +1275,9 @@ class UserDefinedObjectVariable(UserDefinedVariable):
 
     def python_type(self) -> type:
         return self.value_type  # type: ignore[return-value]
+
+    def get_real_python_backed_value(self) -> object:
+        return self.value
 
     def as_python_constant(self) -> object:
         if self.is_pytree_constant_class and self.source:
@@ -1468,7 +1511,20 @@ class UserDefinedObjectVariable(UserDefinedVariable):
             # NOTE: else we assume the descriptor (if any) has a
             # side-effect-free `__set__` as far as Dynamo tracing is concerned.
 
-        # Emulate the standard setattr on instance dict.
+        # If the code reaches here, the attribute is either:
+        #  1) a slot descriptor
+        #  2) a plain attribute with no descriptor
+        # If the object has no __dict__, only slot descriptors (member_descriptor)
+        # allow mutation. Any other attribute assignment raises AttributeError.
+        if not hasattr(self.value, "__dict__"):
+            descriptor = self.lookup_class_mro_attr(name_str)
+            if not inspect.ismemberdescriptor(descriptor):
+                error_msg = VariableTracker.build(
+                    tx,
+                    f"'{type(self.value).__name__}' object has no attribute '{name_str}'",
+                )
+                raise_observed_exception(AttributeError, tx, args=[error_msg])
+
         tx.output.side_effects.store_attr(self, name_str, value)
         return variables.CONSTANT_VARIABLE_NONE
 
@@ -1687,6 +1743,7 @@ class UserDefinedObjectVariable(UserDefinedVariable):
             mutated_attr = tx.output.side_effects.load_attr(self, key, deleted_ok=True)
             return not isinstance(mutated_attr, variables.DeletedVariable)
 
+        # TODO(guilhermeleobas): This can trigger a side effect
         return key in self.value.__dict__
 
     def get_source_by_walking_mro(
@@ -1805,6 +1862,8 @@ class UserDefinedObjectVariable(UserDefinedVariable):
             return result
 
         if name == "__dict__":
+            if not hasattr(self.value, "__dict__"):
+                raise_observed_exception(AttributeError, tx)
             return self.get_dict_vt(tx)
 
         # TODO(anijain2305) - Investigate if we need specialization for more
@@ -1846,6 +1905,8 @@ class UserDefinedObjectVariable(UserDefinedVariable):
             return self.resolve_data_descriptor(tx, name, type_attr, source)
 
         # Step 3: Instance __dict__ — return as-is, no descriptor invocation.
+        # TODO(guilhermeleobas): step 3 should look into dict_vt and not self.value.__dict__
+        # as the object could have mutated an attribute via setattr
         if hasattr(self.value, "__dict__") and name in self.value.__dict__:
             subobj = self.value.__dict__[name]
             source = self.maybe_wrap_nn_module_source_for_instance(tx, name, source)
@@ -2095,11 +2156,7 @@ class UserDefinedObjectVariable(UserDefinedVariable):
     ) -> Source | None:
         """Wrap source for nn.Module instance dict attribute access if needed."""
         if (
-            (
-                torch._dynamo.config.inline_inbuilt_nn_modules
-                or isinstance(self, variables.FSDPManagedNNModuleVariable)
-            )
-            and source
+            source
             and isinstance(self, variables.UnspecializedNNModuleVariable)
             and (not tx.output.export or torch._dynamo.config.install_free_tensors)
         ):

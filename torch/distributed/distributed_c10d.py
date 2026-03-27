@@ -1147,9 +1147,11 @@ def _get_group_size(group: ProcessGroup | None) -> int:
     return group.size()
 
 
-def _get_group_size_by_name(group_name: GroupName) -> int:
-    group = _resolve_process_group(group_name)
-    return group.size()
+def _get_group_size_by_name(group_name: GroupName | ProcessGroup) -> int:
+    if isinstance(group_name, str):
+        # pyrefly: ignore[bad-argument-type]  # pyrefly bug
+        group_name = _resolve_process_group(group_name)
+    return group_name.size()
 
 
 def _resolve_group_name_by_ranks_and_tag(ranks: list[int], tag: str) -> GroupName:
@@ -5451,10 +5453,18 @@ def split_group(
         )
 
     parent_group_rank = parent_global_to_group_ranks[global_rank]
-    parent_backend = parent_pg._get_backend(torch.device("cuda"))
+
+    if torch.accelerator.is_available():
+        parent_backend = parent_pg._get_backend(
+            torch.accelerator.current_accelerator()  # pyrefly: ignore[bad-argument-type]
+        )
+    else:
+        raise RuntimeError(
+            "No backend for the parent process group or its backend does not support splitting"
+        )
 
     # if the parent backend does not support splitting, raise error
-    # currently this API only support NCCL backend
+    # currently this API only support NCCL and XCCL backend
     if (
         not parent_backend or not parent_backend.supports_splitting
     ) and not _use_torchcomms_enabled():
@@ -5520,7 +5530,16 @@ def split_group(
 
     global_ranks_in_my_group = [parent_group_to_global_ranks[rank] for rank in my_group]
     split_pg.bound_device_id = device_id  # type: ignore[union-attr]
-    split_backend_class = split_pg._get_backend(torch.device("cuda"))
+
+    if torch.accelerator.is_available():
+        split_backend_class = split_pg._get_backend(
+            torch.accelerator.current_accelerator()  # pyrefly: ignore[bad-argument-type]
+        )
+    else:
+        raise RuntimeError(
+            "No backend for the parent process group or its backend does not support splitting"
+        )
+
     if not _use_torchcomms_enabled():
         split_backend_class._set_sequence_number_for_group()
     if split_pg.group_name != group_name:
