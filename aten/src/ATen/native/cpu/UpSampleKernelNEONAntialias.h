@@ -351,7 +351,7 @@ void upsample_neon_bilinear_bicubic_uint8(const at::Tensor& input_,
 
   at::Tensor buffer_horiz;
   if (need_horizontal && need_vertical) {
-    buffer_horiz = at::empty({num_channels, yin, xout}, input.options());
+    buffer_horiz = input.new_empty({num_channels, yin, xout});
   }
   // cl_output is the destination for the final interpolation result (in CL
   // format). When the output is already CL, we write directly to output[i].
@@ -359,8 +359,8 @@ void upsample_neon_bilinear_bicubic_uint8(const at::Tensor& input_,
   // converts interleaved data back into CF.
   at::Tensor cl_output;
   if (output_is_not_cl) {
-    cl_output = at::empty({1, num_channels, yout, xout},
-        input.options().memory_format(at::MemoryFormat::ChannelsLast))[0];
+    cl_output = input.new_empty({1, num_channels, yout, xout},
+        at::TensorOptions().memory_format(at::MemoryFormat::ChannelsLast))[0];
   }
 
   for (const auto i : c10::irange(batch_size)) {
