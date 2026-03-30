@@ -14,13 +14,15 @@ import warnings
 from torch import inf, nan
 from torch.testing import make_tensor
 from torch.testing._internal.common_dtype import (
-    all_types_and_complex_and, get_all_math_dtypes, integral_types, complex_types, floating_types_and,
+    all_types_and_complex_and, get_all_math_dtypes, highest_precision_float,
+    integral_types, complex_types, floating_types_and,
     integral_types_and, floating_and_complex_types_and, all_types_and, all_types,
 )
 from torch.testing._internal.common_utils import (
     TestCase, run_tests, skipIfNoSciPy, slowTest, torch_to_numpy_dtype_dict,
     parametrize,
     skipIfTorchDynamo,
+    skipIfRocm,
     IS_WINDOWS)
 from torch.testing._internal.common_device_type import (
     OpDTypes, expectedFailureMeta, instantiate_device_type_tests, onlyCPU, dtypes, dtypesIfCUDA, dtypesIfCPU,
@@ -1605,8 +1607,8 @@ class TestReductions(TestCase):
         self.assertEqual(torch.bucketize(values_0_el, boundaries), expected_result)
 
         # nan input
-        values_nan = torch.tensor([1.0, float('nan'), 2.0, float('nan')], device=device, dtype=torch.float64)
-        boundaries = torch.tensor([0.0, 1.0, 2.0, 3.0], device=device, dtype=torch.float64)
+        values_nan = torch.tensor([1.0, float('nan'), 2.0, float('nan')], device=device, dtype=highest_precision_float(device))
+        boundaries = torch.tensor([0.0, 1.0, 2.0, 3.0], device=device, dtype=highest_precision_float(device))
         expected_result = torch.tensor([1, 4, 2, 4], device=device)
         self.assertEqual(torch.searchsorted(boundaries, values_nan), expected_result)
         expected_result = torch.tensor([2, 4, 3, 4], device=device)
@@ -1615,7 +1617,7 @@ class TestReductions(TestCase):
 
         # type promotion and non contiguous tensors
         values_3d_permute = values_3d.permute(2, 1, 0).to(torch.int32)
-        boundaries_permute = values_3d.permute(2, 1, 0).to(torch.float64)
+        boundaries_permute = values_3d.permute(2, 1, 0).to(highest_precision_float(device))
         expected_result = torch.tensor([[[0, 0], [0, 1]], [[2, 0], [0, 1]], [[2, 0], [0, 0]]], device=device)
         if self.device_type != 'xla':
             self.assertWarnsRegex(
@@ -2523,6 +2525,7 @@ class TestReductions(TestCase):
     @dtypes(torch.int, torch.long, torch.float, torch.double)
     @dtypesIfCUDA(torch.int, torch.long, torch.half, torch.float, torch.double)
     @dtypesIfXPU(torch.int, torch.long, torch.half, torch.float, torch.double)
+    @skipIfRocm(msg="Fails with Triton 3.7 on MI200")
     def test_median_real_values(self, device, dtype):
         # Generate random 0-3D sizes
         sizes = [random.sample(range(1, 32), i) for i in range(4) for _ in range(2)]
@@ -2553,6 +2556,7 @@ class TestReductions(TestCase):
     @dtypes(torch.float, torch.double)
     @dtypesIfCUDA(torch.half, torch.float, torch.double)
     @dtypesIfXPU(torch.half, torch.float, torch.double)
+    @skipIfRocm(msg="Fails with Triton 3.7 on MI200")
     def test_median_nan_values(self, device, dtype):
         # Generate random 0-3D sizes
         sizes = [random.sample(range(1, 32), i) for i in range(4) for _ in range(2)]
@@ -2591,6 +2595,7 @@ class TestReductions(TestCase):
                     ref = numpy_op(t_numpy, dim, keepdims=True)[mask.cpu().numpy()]
                     self.assertEqual(res, torch.from_numpy(ref))
 
+    @skipIfRocm(msg="Fails with Triton 3.7 on MI200")
     def test_median_corner_cases(self, device):
         def check(op, a, args, key):
             t = torch.tensor(a, device=device)
