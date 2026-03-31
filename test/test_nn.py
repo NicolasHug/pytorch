@@ -10577,8 +10577,6 @@ class TestNNDeviceType(NNTestCase):
         check_forward_ad = torch.device(device).type != 'xla'
 
         if mode == "lanczos":
-            if torch.device(device).type != "cpu":
-                raise SkipTest("Lanczos mode is only supported on CPU")
             if not antialias:
                 raise SkipTest("Lanczos mode requires antialias=True")
             if align_corners:
@@ -10662,8 +10660,6 @@ class TestNNDeviceType(NNTestCase):
                 should_raise_runtime_error = False
 
         elif mode == "lanczos":
-            if torch.device(device).type != "cpu":
-                raise SkipTest("Lanczos mode is only supported on CPU")
             if not antialias:
                 raise SkipTest("Lanczos mode requires antialias=True")
             if dtype in floating_types() or (device == "cpu" and dtype == torch.uint8):
@@ -10846,7 +10842,8 @@ class TestNNDeviceType(NNTestCase):
         t_out = F.interpolate(t_in, size=(2, 2), mode="bicubic", align_corners=False, antialias=True)
         self.assertEqual(expected_out, t_out)
 
-    @onlyCPU
+    @skipIfMPS
+    @onlyNativeDeviceTypes
     @parametrize_test("memory_format", [torch.contiguous_format, torch.channels_last])
     def test_upsamplingLanczos2d_aa_correctness(self, device, memory_format):
         t_in = torch.arange(3 * 8 * 8, dtype=torch.float, device=device).reshape(1, 3, 8, 8)
@@ -10863,7 +10860,8 @@ class TestNNDeviceType(NNTestCase):
         t_out = F.interpolate(t_in, size=(2, 2), mode="lanczos", align_corners=False, antialias=True)
         self.assertEqual(expected_out, t_out)
 
-    @onlyCPU
+    @skipIfMPS
+    @onlyNativeDeviceTypes
     def test_upsamplingLanczos2d_errors(self, device):
         # 3D input (1D spatial) not supported
         x_3d = torch.randn(1, 3, 8, device=device)
@@ -10884,7 +10882,8 @@ class TestNNDeviceType(NNTestCase):
         with self.assertRaisesRegex(ValueError, "align_corners=True"):
             F.interpolate(x_4d, size=(4, 4), mode="lanczos", align_corners=True, antialias=True)
 
-    @onlyCPU
+    @skipIfMPS
+    @onlyNativeDeviceTypes
     def test_upsamplingLanczos2d_identity(self, device):
         x = torch.randn(1, 3, 8, 8, device=device)
         out = F.interpolate(x, size=(8, 8), mode="lanczos", align_corners=False, antialias=True)
