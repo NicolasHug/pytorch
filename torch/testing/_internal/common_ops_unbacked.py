@@ -22,6 +22,7 @@ ops_dde_xfail = {
     xfail("_chunk_cat"),
     xfail("_unsafe_masked_index_put_accumulate"),
     xfail("_upsample_bilinear2d_aa"),
+    xfail("_upsample_lanczos2d_aa"),
     xfail("addmv"),
     xfail("allclose"),
     xfail("as_strided_scatter"),

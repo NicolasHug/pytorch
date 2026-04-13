@@ -375,6 +375,7 @@ dtensor_fails_no_strategy = {
     xfail("_unsafe_masked_index"),
     xfail("_unsafe_masked_index_put_accumulate"),
     xfail("_upsample_bilinear2d_aa"),
+    xfail("_upsample_lanczos2d_aa"),
     xfail("addbmm"),
     xfail("allclose"),
     xfail("as_strided"),

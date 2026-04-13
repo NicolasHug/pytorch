@@ -242,6 +242,7 @@ inductor_expected_failures_single_sample = defaultdict(dict)
 
 inductor_expected_failures_single_sample["cpu"] = {
     "_upsample_bilinear2d_aa": {f32, f64},
+    "_upsample_lanczos2d_aa": {f32, f64},
     "cholesky": {f32, f64},
     "complex": {f16},
     "resize_": {b8, f16, f32, f64, i32, i64},
@@ -264,6 +265,7 @@ inductor_expected_failures_single_sample["cpu"] = {
 
 inductor_expected_failures_single_sample["cuda"] = {
     "_upsample_bilinear2d_aa": {f16, f32, f64},
+    "_upsample_lanczos2d_aa": {f16, f32, f64},
     "cholesky": {f32, f64},
     "multinomial": {f16, f32, f64},
     ("normal", "in_place"): {f16, f32, f64},
@@ -284,6 +286,7 @@ inductor_expected_failures_single_sample["cuda"] = {
 
 inductor_expected_failures_single_sample["xpu"] = {
     "_upsample_bilinear2d_aa": {f16, f32, f64},
+    "_upsample_lanczos2d_aa": {f16, f32, f64},
     "cholesky": {f32, f64},
     "multinomial": {f16, f32, f64},
     ("normal", "in_place"): {f16, f32, f64},
