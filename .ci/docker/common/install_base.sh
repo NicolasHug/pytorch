@@ -22,6 +22,11 @@ install_ubuntu() {
 
   # Install common dependencies
   apt-get update
+  # Install prerequisites for add-apt-repository (needs gpg-agent for PPA key import)
+  apt-get install -y --no-install-recommends software-properties-common gpg-agent
+  # Add git-core PPA for a newer version of git
+  add-apt-repository ppa:git-core/ppa -y
+  apt-get update
   # TODO: Some of these may not be necessary
   ccache_deps="asciidoc docbook-xml docbook-xsl xsltproc"
   deploy_deps="libffi-dev libbz2-dev libreadline-dev libncurses5-dev libncursesw5-dev libgdbm-dev libsqlite3-dev uuid-dev tk-dev"
@@ -57,7 +62,8 @@ install_ubuntu() {
     unzip \
     gpg-agent \
     gdb \
-    bc
+    bc \
+    zip
 
   # Should resolve issues related to various apt package repository cert issues
   # see: https://github.com/pytorch/pytorch/issues/65931
@@ -68,54 +74,11 @@ install_ubuntu() {
   rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 }
 
-install_centos() {
-  # Need EPEL for many packages we depend on.
-  # See http://fedoraproject.org/wiki/EPEL
-  yum --enablerepo=extras install -y epel-release
-
-  ccache_deps="asciidoc docbook-dtds docbook-style-xsl libxslt"
-  numpy_deps="gcc-gfortran"
-  yum install -y \
-    $ccache_deps \
-    $numpy_deps \
-    autoconf \
-    automake \
-    bzip2 \
-    cmake \
-    cmake3 \
-    curl \
-    gcc \
-    gcc-c++ \
-    gflags-devel \
-    git \
-    glibc-devel \
-    glibc-headers \
-    glog-devel \
-    libstdc++-devel \
-    libsndfile-devel \
-    make \
-    opencv-devel \
-    sudo \
-    wget \
-    vim \
-    unzip \
-    gdb
-
-  # Cleanup
-  yum clean all
-  rm -rf /var/cache/yum
-  rm -rf /var/lib/yum/yumdb
-  rm -rf /var/lib/yum/history
-}
-
 # Install base packages depending on the base OS
 ID=$(grep -oP '(?<=^ID=).+' /etc/os-release | tr -d '"')
 case "$ID" in
   ubuntu)
     install_ubuntu
-    ;;
-  centos)
-    install_centos
     ;;
   *)
     echo "Unable to determine OS..."

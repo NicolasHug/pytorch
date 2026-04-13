@@ -208,7 +208,12 @@ fx_wrapper: bool = os.environ.get("TORCHINDUCTOR_FX_WRAPPER", "0") == "1"
 # Controls automatic precompiling of common include files for codecache.CppCodeCache
 # (i.e. for cpp_wrapper mode and for cpp kernels on CPU).  AOTI header precompiling is
 # controlled by a separate flag.
-cpp_cache_precompile_headers: bool = not is_fbcode()
+cpp_cache_precompile_headers: bool = (
+    os.environ.get(
+        "TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS", "0" if is_fbcode() else "1"
+    )
+    == "1"
+)
 
 online_softmax = os.environ.get("TORCHINDUCTOR_ONLINE_SOFTMAX", "1") == "1"
 
@@ -817,7 +822,17 @@ assume_unaligned_fallback_output = (
     os.environ.get("TORCHINDUCTOR_ASSUME_UNALIGNED_FALLBACK_OUTPUT") == "1"
 )
 
-# Custom InductorChoices callable to use (can be a class or functools.partial with kwargs)
+# Factory callable that returns a custom InductorChoices instance.
+# A callable (rather than a class) is used to defer imports and avoid circular
+# dependencies between config and the choices module. Example:
+#
+#     def _custom_choices_factory():
+#         from my_package.choices import MyInductorChoices
+#         return MyInductorChoices()
+#
+#     config.inductor_choices_class = _custom_choices_factory
+#
+# The returned instance must implement uuid() for cache key serialization.
 inductor_choices_class: Callable[[], "InductorChoices"] | None = None
 
 # fuse even in cases without common reads
@@ -1761,6 +1776,15 @@ class triton:
         os.environ.get("TORCHINDUCTOR_PERSISTENT_REDUCTIONS", "1") == "1"
     )
 
+    # Decompose sort-based ops (sort, mode, median) to generate Triton
+    # kernels instead of falling back to ATen eager.  When enabled, sort
+    # removes the default 512-element dimension limit and uses int32
+    # indices (up to 2^31-1 elements), and mode/median decompose into
+    # sort + reduction / pointwise ops that Inductor can lower to Triton.
+    decompose_sort_ops: bool = (
+        os.environ.get("TORCHINDUCTOR_DECOMPOSE_SORT_OPS", "0") == "1"
+    )
+
     # For small output size reductions uses cross thread-block synchronization to gain more parallelism
     cooperative_reductions = (
         os.environ.get("TORCHINDUCTOR_COOPERATIVE_REDUCTIONS", "0") == "1"
@@ -1933,6 +1957,11 @@ class aot_inductor:
 
     debug_compile = os.environ.get("AOT_INDUCTOR_DEBUG_COMPILE", "0") == "1"
     debug_symbols = os.environ.get("AOT_INDUCTOR_DEBUG_SYMBOLS", "0") == "1"
+
+    # Enable frame pointers for profiling tools (e.g. strobelight)
+    enable_frame_pointer = (
+        os.environ.get("AOT_INDUCTOR_ENABLE_FRAME_POINTER", "0") == "1"
+    )
 
     # Annotate generated main wrapper function, i.e. AOTInductorModel::run_impl,
     # to use which cpp compiler optimization level, default to O1
@@ -2278,6 +2307,11 @@ class xpu(cutlass):
     # e.g. "20250201".
     version: str | None = None
 
+    # Path to Intel OneAPI.
+    oneapi_root: str | None = None
+
+    cutlass_dir = os.path.realpath(os.environ.get("TORCHINDUCTOR_CUTLASS_DIR", ""))
+
 
 class rocm:
     # Offload arch list for device code compilation, e.g. ["gfx90a", "gfx942"].
@@ -2518,6 +2552,12 @@ _cache_config_ignore_prefix: list[str] = [
     "fx_graph_remote_cache",
     "autotune_local_cache",
     "autotune_remote_cache",
+]
+
+# Config keys whose values are callable factories. save_config_portable will
+# instantiate the factory and use .uuid() for serialization.
+_cache_config_factory_keys: list[str] = [
+    "inductor_choices_class",
 ]
 
 # External callable for matmul tuning candidates

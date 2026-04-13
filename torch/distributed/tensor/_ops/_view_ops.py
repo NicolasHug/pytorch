@@ -65,11 +65,26 @@ class Singleton(DimSpec):
     """Output dimension is a singleton."""
 
 
-@dataclass
+@dataclass(eq=False)
 class InputDim(DimSpec):
     """Output dimension maps directly to an input dimension."""
 
     input_dim: int
+
+    def __eq__(self, other: object) -> bool:
+        """Raises TypeError for non-DimSpec comparisons to catch accidental
+        ``shard.dim == input_dim`` bugs where ``.input_dim`` was intended."""
+        if isinstance(other, InputDim):
+            return self.input_dim == other.input_dim
+        if not isinstance(other, DimSpec):
+            raise TypeError(
+                f"Cannot compare InputDim with {type(other).__name__}. "
+                f"Did you mean to use .input_dim?"
+            )
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash((InputDim, self.input_dim))
 
 
 @dataclass
@@ -1102,6 +1117,13 @@ class _ViewShardingPropagator:
                     f"{tgt_shard_dims} for Shard(dim={p.dim}) on mesh dim {mesh_dim}."
                 )
         cmd = self.rule[tgt_shard_dim]
+        if isinstance(cmd, Split) and isinstance(cmd.input_dim, Flatten):
+            first_dim = cmd.input_dim.input_dims[0]
+            if isinstance(first_dim, InputDim) and p.dim != first_dim.input_dim:
+                raise RuntimeError(
+                    f"Shard(dim={p.dim}) through Split(Flatten(...), {cmd.group_shape}) "
+                    f"is not supported yet for non-first flatten dims."
+                )
         if isinstance(cmd, (Split, InputDim)):
             # Split/InputDim: 1:1 dim mapping, sharding transfers directly.
             # Flatten needs stride computation below (multiple dims merge).
@@ -1269,12 +1291,17 @@ def register_op_strategy_map(
                 placements=tuple(input_tgt_placements),
                 mesh=mesh,
                 tensor_meta=input_src_spec.tensor_meta,
+                use_strided_shard_as_shard_order=False,
             )
             redistribute_costs: list[list[float]] = [
                 generate_redistribute_costs(input_strategy, input_tgt_spec)
             ]
 
-            output_spec = DTensorSpec(mesh=mesh, placements=tuple(output_placements))
+            output_spec = DTensorSpec(
+                mesh=mesh,
+                placements=tuple(output_placements),
+                use_strided_shard_as_shard_order=False,
+            )
             output_strategy.strategies.append(
                 OpSpec(
                     output_specs=output_spec,
