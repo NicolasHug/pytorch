@@ -2920,6 +2920,24 @@ def get_items_from_dict(obj: dict[K, V]) -> Iterable[tuple[K, V | Any]]:
         return [(k, dict.__getitem__(obj, k)) for k in dict.keys(obj)]
 
 
+def enumerate_items_with_dict_position(
+    obj: dict[K, V],
+) -> Iterable[tuple[int, K, V | Any]]:
+    """Enumerate dict items yielding (dict_keys_position, key, value).
+
+    For OrderedDicts where move_to_end/prepend has been used, the OrderedDict
+    iteration order can differ from dict.keys() order.  We iterate in
+    OrderedDict order (correct execution semantics) but return each key's
+    dict.keys() position so that ConstDictKeySource indices stay consistent
+    with PyDict_Next / C++ DictGuardManager.
+    """
+    items = get_items_from_dict(obj)
+    if isinstance(obj, OrderedDict):
+        key_to_pos = {k: i for i, k in enumerate(dict.keys(obj))}
+        return ((key_to_pos[k], k, v) for k, v in items)
+    return ((i, k, v) for i, (k, v) in enumerate(items))
+
+
 def nn_module_new(cls: Any) -> Any:
     obj = object_new(cls)
     torch.nn.Module.__init__(obj)
@@ -2988,12 +3006,10 @@ dict_getitem = dict.__getitem__
 
 @torch.fx.wrap
 def dict_keys_getitem(d: dict[Any, Any], n: int) -> Any:
-    # Call dict(d) to prevent calling overridden __iter__/keys
-    dict_class = dict
-    if isinstance(d, OrderedDict):
-        dict_class = OrderedDict
+    # Use dict.keys() to match the iteration order of PyDict_Next used by
+    # the C++ DictGuardManager and by ConstDictKeySource._name_template.
     # pyrefly: ignore [bad-argument-type]
-    return next(itertools.islice(dict_class.keys(d), n, n + 1))
+    return next(itertools.islice(dict.keys(d), n, n + 1))
 
 
 def set_getitem(s: set[T], n: int) -> T:
@@ -3058,7 +3074,6 @@ def raise_args_mismatch(
     actual: str = "",
 ) -> None:
     from torch._dynamo.exc import raise_observed_exception
-    from torch._dynamo.variables import ConstantVariable
 
     msg_str = (
         f"wrong number of arguments or keyword arguments for {name}() call.\n"
@@ -3069,7 +3084,7 @@ def raise_args_mismatch(
     raise_observed_exception(
         TypeError,
         tx,
-        args=[ConstantVariable(msg_str)],
+        args=[msg_str],
     )
 
 

@@ -71,10 +71,12 @@ from torch.testing._internal.common_utils import (
     find_library_location,
     IS_FBCODE,
     IS_MACOS,
+    IS_ARM64,
+    IS_LINUX,
     IS_WINDOWS,
     run_tests,
     skipIfTorchDynamo,
-    skipIfRocm,
+    xfailIf,
 )
 from torch.testing._internal.jit_utils import JitTestCase
 
@@ -2055,6 +2057,7 @@ class TestFX(JitTestCase):
                         f"got {tensor_meta[1].shape}"
                     )
 
+    @xfailIf(IS_ARM64 and IS_LINUX) # RuntimeError: label is too far
     def test_shape_prop_layout_3d(self):
         class ConvTest3d(torch.nn.Module):
             def __init__(self) -> None:
@@ -4429,7 +4432,6 @@ def forward(self, args_list: List[torch.Tensor]){maybe_return_annotation}:
         torch.fx.proxy.TracerBase.check_mutable_operations = orig_tracer_mutable_flag
 
     # This only fails on navi31
-    @skipIfRocm(msg="Fails with Triton 3.7")
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
     @torch.fx.experimental._config.patch("enrich_profiler_metadata", True)
     @blas_library_context("cublaslt")

@@ -395,6 +395,7 @@ class GraphLowering(torch.fx.Interpreter):
         self.const_kernel_code = const_kernel_code
         self.const_module = const_module
         self.inputs_to_check = inputs_to_check
+        self._defers_input_alignment = False
 
         self.extra_traceback = False  # we do our own error wrapping
         if shape_env is None:
@@ -663,6 +664,12 @@ class GraphLowering(torch.fx.Interpreter):
         """
         if (dep, count_bytes) not in self.dep_size_hint_cache:
             res = 0
+            # Non-tensor graph inputs (TorchBindObject, OpaqueObjectState)
+            # have no meaningful size — skip the size computation entirely.
+            inp = self.graph_inputs.get(dep.name)
+            if isinstance(inp, ir.NonTensorObj):
+                self.dep_size_hint_cache[(dep, count_bytes)] = 0
+                return 0
             try:
                 if (
                     not dep.has_unbacked_symbols()
@@ -1326,7 +1333,12 @@ class GraphLowering(torch.fx.Interpreter):
             )
             base_name = target.name().split(".")[0]
             if base_name in FALLBACK_ALLOW_LIST:
-                make_fallback(target, warn=False, get_decomp_fn=self.get_decomp_fn)
+                make_fallback(
+                    target,
+                    warn=False,
+                    get_decomp_fn=self.get_decomp_fn,
+                    override_decomp=True,
+                )
             elif config.implicit_fallbacks:
                 error = (
                     MissingOperatorWithDecomp
@@ -1517,7 +1529,7 @@ class GraphLowering(torch.fx.Interpreter):
                     value=value.item(), dtype=value.dtype, device=value.device
                 )
             if self.can_inline_constant(value):
-                log.debug("Inlining constant: %s ", str(target))
+                log.debug("Inlining constant: %s ", target)
                 # tensor lowering has constant inlining logic
                 from .lowering import tensor
 
@@ -1563,6 +1575,7 @@ class GraphLowering(torch.fx.Interpreter):
                     TorchBindObject,
                     ir.OpaqueMultiOutput,
                     ir.OpaqueValueTypeConstant,
+                    ir.OpaqueObjectState,
                 ),
             )
             for x in result
@@ -1805,6 +1818,7 @@ class GraphLowering(torch.fx.Interpreter):
             self._realize_inputs_at_stream_boundaries(n)
         with (
             ir.IRNode.current_origins(origins),
+            ir.IRNode.current_stream_idx(self._get_node_stream(n)),
             self.set_current_node(n),
             V.set_current_node(n),
         ):
