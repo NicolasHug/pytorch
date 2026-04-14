@@ -1,7 +1,8 @@
 // NEON-optimized uint8 bilinear resize with antialiasing for aarch64.
 //
 // This is the NEON counterpart of UpSampleKernelAVXAntialias.h.
-// It only supports num_channels == 3 with channels-last input.
+// It only supports num_channels == 3. Input is converted to channels-last
+// internally if needed.
 
 #pragma once
 #if defined(__aarch64__)
@@ -290,7 +291,9 @@ void NeonResampleVertical(const at::Tensor& unpacked_output,
 
 // Main entry point for NEON-accelerated uint8 bilinear resize.
 //
-// Only supports num_channels == 3 with channels-last memory format.
+// Only supports num_channels == 3. Input may be in any memory format; it is
+// converted to channels-last internally. Output is written back in its
+// original format.
 // Mirrors upsample_avx_bilinear_bicubic_uint8 but uses NEON intrinsics and
 // works directly on interleaved RGB data (no unpack/pack step needed).
 //
@@ -318,7 +321,7 @@ void upsample_neon_bilinear_bicubic_uint8(const at::Tensor& input_,
   TORCH_INTERNAL_ASSERT(num_channels == 3);
 
   auto input = input_.contiguous(at::MemoryFormat::ChannelsLast);
-  bool output_is_not_cl = !output.is_contiguous(at::MemoryFormat::ChannelsLast);
+  bool output_is_cl = output.is_contiguous(at::MemoryFormat::ChannelsLast);
 
   auto need_horizontal = xout != xin;
   auto need_vertical = yout != yin;
@@ -364,13 +367,13 @@ void upsample_neon_bilinear_bicubic_uint8(const at::Tensor& input_,
   // Otherwise we need a CL buffer so that output[i].copy_() correctly
   // converts interleaved data back into CF.
   at::Tensor cl_output;
-  if (output_is_not_cl) {
+  if (!output_is_cl) {
     cl_output = input.new_empty({1, num_channels, yout, xout},
         at::TensorOptions().memory_format(at::MemoryFormat::ChannelsLast))[0];
   }
 
   for (const auto i : c10::irange(batch_size)) {
-    if (!output_is_not_cl) {
+    if (output_is_cl) {
       cl_output = output[i];
     }
     at::Tensor input_slice = input[i];
@@ -386,7 +389,7 @@ void upsample_neon_bilinear_bicubic_uint8(const at::Tensor& input_,
       NeonResampleVertical(cl_output, input_slice, ksize_vert, vert_indices_weights, vert_weights_precision);
     }
 
-    if (output_is_not_cl) {
+    if (!output_is_cl) {
       output[i].copy_(cl_output);
     }
   }
